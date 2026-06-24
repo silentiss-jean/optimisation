@@ -1,27 +1,32 @@
-from typing import Dict, Any, List
 from abc import ABC, abstractmethod
+from typing import Dict, Any
+
 
 class Tool(ABC):
-    """Base class for all agent tools."""
-    
+    """
+    Classe de base pour tous les outils de l'agent.
+    Chaque outil déclare son nom, sa description et ses paramètres dans __init__.
+    ToolDispatcher les enregistre et les dispatche automatiquement.
+    """
+
     def __init__(self, name: str, description: str, parameters: Dict[str, Any]):
-        self.name = name
+        self.name        = name
         self.description = description
-        self.parameters = parameters
+        self.parameters  = parameters
 
     @property
     def definition(self) -> Dict[str, Any]:
-        """Returns the tool definition in a format compatible with most LLM APIs."""
+        """Définition au format function-calling (OpenAI compatible)."""
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters
+                "parameters": self.parameters,
             }
         }
 
     @abstractmethod
     def execute(self, **kwargs) -> str:
-        """Execute the tool logic and return a string result."""
+        """Exécute l'outil et retourne une chaîne lisible par le LLM."""
         pass

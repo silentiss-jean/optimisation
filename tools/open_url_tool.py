@@ -1,13 +1,22 @@
 import webbrowser
+from .base_tool import Tool
 
 
-class OpenUrlTool:
-    """
-    Ouvre une URL dans le navigateur par défaut du système.
-    Retourne un message éxplicite DONE pour que le LLM sache que la tâche est terminée.
-    """
+class OpenUrlTool(Tool):
+    def __init__(self):
+        super().__init__(
+            name="open_url",
+            description="Ouvrir une URL dans le navigateur par défaut du système.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL complète à ouvrir (https://...)."}
+                },
+                "required": ["url"]
+            }
+        )
 
-    def open_url(self, url: str) -> str:
+    def execute(self, url: str, **kwargs) -> str:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         try:
