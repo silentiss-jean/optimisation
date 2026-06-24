@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QGroupBox, QFormLayout
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat
 
 from providers.llm_provider_interface import LLMProvider
 from providers.ollama_provider import OllamaProvider
@@ -13,7 +14,10 @@ from providers.lmstudio_provider import LMStudioProvider
 from providers.openai_provider import OpenAIProvider
 from providers.perplexity_provider import PerplexityProvider
 from tools.tool_dispatcher import ToolDispatcher
-from tools.agent_orchestrator import AgentOrchestrator
+from tools.agent_orchestrator import (
+    AgentOrchestrator,
+    EVT_THINKING, EVT_ACTION, EVT_OBSERVE, EVT_ANSWER, EVT_STEP, EVT_WARNING, EVT_SECURITY
+)
 
 
 # Modèles par défaut par provider
@@ -23,52 +27,61 @@ PROVIDER_DEFAULTS = {
     "OpenAI / OpenRouter (cloud)": "gpt-3.5-turbo",
     "Perplexity (Sonar)": "sonar",
 }
-
-# Providers nécessitant une clé API
 CLOUD_PROVIDERS = {"OpenAI / OpenRouter (cloud)", "Perplexity (Sonar)"}
-
-# Indications clé API par provider
 API_KEY_HINTS = {
     "OpenAI / OpenRouter (cloud)": "sk-... (ou via OPENAI_API_KEY)",
-    "Perplexity (Sonar)": "pplx-... → https://console.perplexity.ai",
+    "Perplexity (Sonar)": "pplx-... → console.perplexity.ai",
 }
 
-# Modèles Perplexity disponibles pour le combobox
-PERPLEXITY_MODELS = [
-    "sonar",
-    "sonar-pro",
-    "sonar-reasoning",
-    "sonar-reasoning-pro",
-    "sonar-deep-research",
-]
+# Couleurs par type d'événement ReAct
+EVENT_COLORS = {
+    EVT_STEP:     "#888888",   # gris  — en-tête d'étape
+    EVT_THINKING: "#cccccc",   # blanc cassé — tokens LLM
+    EVT_ACTION:   "#4fc3f7",   # bleu ciel — appel d'outil
+    EVT_OBSERVE:  "#81c784",   # vert — résultat outil
+    EVT_ANSWER:   "#fff176",   # jaune — réponse finale
+    EVT_WARNING:  "#ff8a65",   # orange — avertissement
+    EVT_SECURITY: "#ef5350",   # rouge — blocage sécurité
+}
+
+# Préfixes affichés dans le chat
+EVENT_PREFIX = {
+    EVT_STEP:     "\n╍╍╍ {data} ╍╍╍",
+    EVT_THINKING: "{data}",
+    EVT_ACTION:   "\n🔧 Outil : {data}",
+    EVT_OBSERVE:  "\n📍 Observation : {data}",
+    EVT_ANSWER:   "\n✅ Réponse finale :\n{data}",
+    EVT_WARNING:  "\n⚠️ {data}",
+    EVT_SECURITY: "\n🛑 {data}",
+}
 
 
 class LLMWorker(QThread):
-    log_signal = pyqtSignal(str)
+    # Émet (event_type, data) — data peut être vide pour EVT_THINKING de début
+    event_signal    = pyqtSignal(str, str)
     finished_signal = pyqtSignal(bool, str)
 
-    def __init__(self, initial_prompt: str, llm_provider: LLMProvider, dispatcher: ToolDispatcher):
+    def __init__(self, initial_prompt: str, llm_provider: LLMProvider,
+                 dispatcher: ToolDispatcher):
         super().__init__()
         self.initial_prompt = initial_prompt
-        self.llm_provider = llm_provider
-        self.dispatcher = dispatcher
+        self.llm_provider   = llm_provider
+        self.dispatcher     = dispatcher
 
     def run(self):
         try:
-            orchestrator = AgentOrchestrator(llm_provider=self.llm_provider, dispatcher=self.dispatcher)
+            orchestrator = AgentOrchestrator(
+                llm_provider=self.llm_provider,
+                dispatcher=self.dispatcher,
+                on_event=lambda evt, data: self.event_signal.emit(evt, data)
+            )
             final_answer = orchestrator.run_agentic_cycle(self.initial_prompt)
-
             if final_answer:
-                self.log_signal.emit(f"\U0001f916 Réponse finale :\n\n{final_answer}")
-                self.finished_signal.emit(True, "Processus terminé avec succès.")
+                self.finished_signal.emit(True, "")
             else:
-                self.log_signal.emit("\U0001f6d1 Le cycle agentique n'a pas pu aboutir à une réponse finale.")
-                self.finished_signal.emit(False, "Échec inconnu.")
-
+                self.finished_signal.emit(False, "Pas de réponse finale.")
         except Exception as e:
-            error_msg = f"\U0001f6a8 EXCEPTION : {e}"
-            print(error_msg)
-            self.log_signal.emit(error_msg)
+            self.event_signal.emit(EVT_WARNING, f"EXCEPTION : {e}")
             self.finished_signal.emit(False, str(e))
 
 
@@ -78,152 +91,167 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Optimisation AI Agent")
         self.setGeometry(100, 100, 1200, 850)
         self.dispatcher = ToolDispatcher()
+        self._thinking_started = False  # contrôle saut de ligne avant les tokens
         self._setup_ui()
 
+    # ------------------------------------------------------------------ providers
     def _build_provider(self) -> LLMProvider:
-        """Instancie le provider sélectionné avec les paramètres saisis dans l'UI."""
         choice = self.provider_combo.currentText()
-        model = self.model_input.text().strip()
-
+        model  = self.model_input.text().strip()
         if choice == "Ollama (local)":
             return OllamaProvider(model=model or "qwen3:8b")
-
         elif choice == "LM Studio (local)":
             return LMStudioProvider(model=model or "local-model")
-
         elif choice == "OpenAI / OpenRouter (cloud)":
             api_key = self.apikey_input.text().strip() or os.environ.get("OPENAI_API_KEY", "")
             if not api_key:
-                QMessageBox.warning(self, "Clé API manquante",
-                    "Entrez votre clé API OpenAI ou définissez OPENAI_API_KEY.")
+                QMessageBox.warning(self, "Clé API", "Entrez votre clé OpenAI ou définissez OPENAI_API_KEY.")
             return OpenAIProvider(model=model or "gpt-3.5-turbo", api_key=api_key)
-
         elif choice == "Perplexity (Sonar)":
             api_key = self.apikey_input.text().strip() or os.environ.get("PERPLEXITY_API_KEY", "")
             if not api_key:
-                QMessageBox.warning(self, "Clé API manquante",
-                    "Entrez votre clé API Perplexity.\n"
-                    "Obtenez-la sur https://console.perplexity.ai → API Keys")
+                QMessageBox.warning(self, "Clé API",
+                    "Entrez votre clé Perplexity.\nhttps://console.perplexity.ai")
             return PerplexityProvider(model=model or "sonar", api_key=api_key)
-
-        # Fallback Ollama
         return OllamaProvider(model="qwen3:8b")
 
-    def _on_provider_changed(self, index: int):
-        """Met à jour l'UI selon le provider choisi."""
-        choice = self.provider_combo.currentText()
+    def _on_provider_changed(self, _index: int):
+        choice   = self.provider_combo.currentText()
         is_cloud = choice in CLOUD_PROVIDERS
-
-        # Afficher/cacher clé API
         self.apikey_label.setVisible(is_cloud)
         self.apikey_input.setVisible(is_cloud)
-
-        # Hint spécifique à chaque provider cloud
         if is_cloud:
-            self.apikey_input.setPlaceholderText(API_KEY_HINTS.get(choice, "Clé API..."))
+            self.apikey_input.setPlaceholderText(API_KEY_HINTS.get(choice, ""))
             self.apikey_input.clear()
-
-        # Pré-remplir le modèle par défaut
-        default_model = PROVIDER_DEFAULTS.get(choice, "")
-        self.model_input.setPlaceholderText(default_model)
+        self.model_input.setPlaceholderText(PROVIDER_DEFAULTS.get(choice, ""))
         self.model_input.clear()
 
-        # Si Perplexity : remplacer le champ modèle par un combobox avec les modèles disponibles
-        if choice == "Perplexity (Sonar)":
-            self.model_input.setPlaceholderText("sonar  (sonar-pro / sonar-reasoning / sonar-deep-research)")
-
+    # ------------------------------------------------------------------ UI
     def _setup_ui(self):
-        central_widget = QWidget()
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(8)
+        central = QWidget()
+        layout  = QVBoxLayout(central)
+        layout.setSpacing(8)
 
-        # --- Groupe configuration provider ---
-        config_group = QGroupBox("Configuration du Provider LLM")
-        config_layout = QFormLayout()
-        config_layout.setSpacing(6)
+        # --- Config provider ---
+        cfg_group  = QGroupBox("Configuration du Provider LLM")
+        cfg_layout = QFormLayout()
+        cfg_layout.setSpacing(6)
 
         self.provider_combo = QComboBox()
         self.provider_combo.addItems(list(PROVIDER_DEFAULTS.keys()))
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
-        config_layout.addRow("Provider :", self.provider_combo)
+        cfg_layout.addRow("Provider :", self.provider_combo)
 
         self.model_input = QLineEdit()
         self.model_input.setPlaceholderText("qwen3:8b")
-        config_layout.addRow("Modèle :", self.model_input)
+        cfg_layout.addRow("Modèle :", self.model_input)
 
         self.apikey_label = QLabel("Clé API :")
         self.apikey_input = QLineEdit()
-        self.apikey_input.setPlaceholderText("Clé API...")
         self.apikey_input.setEchoMode(QLineEdit.EchoMode.Password)
-        config_layout.addRow(self.apikey_label, self.apikey_input)
-
-        # Cacher clé API par défaut (Ollama sélectionné)
+        cfg_layout.addRow(self.apikey_label, self.apikey_input)
         self.apikey_label.setVisible(False)
         self.apikey_input.setVisible(False)
 
-        config_group.setLayout(config_layout)
-        main_layout.addWidget(config_group)
+        cfg_group.setLayout(cfg_layout)
+        layout.addWidget(cfg_group)
 
-        # --- Zone de logs ---
-        main_layout.addWidget(QLabel("Historique de Conversation & Logs :"))
+        # --- Chat (fond sombre pour le streaming coloré) ---
+        layout.addWidget(QLabel("Conversation & Étapes ReAct :"))
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
-        self.log_output.setText(
-            "Bienvenue dans l'Optimisation AI Agent.\n"
-            "Providers disponibles : Ollama · LM Studio · OpenAI/OpenRouter · Perplexity (Sonar)\n"
-            "Sélectionnez un provider et entrez votre requête."
+        self.log_output.setStyleSheet(
+            "background-color: #1e1e1e; color: #cccccc; "
+            "font-family: 'Consolas', monospace; font-size: 13px;"
         )
-        main_layout.addWidget(self.log_output)
+        self._append_colored(
+            "Bienvenue dans l'Optimisation AI Agent.\n"
+            "Providers : Ollama · LM Studio · OpenAI · Perplexity (Sonar)",
+            "#888888"
+        )
+        layout.addWidget(self.log_output)
 
         # --- Barre d'entrée ---
-        input_hbox = QHBoxLayout()
-        self.prompt_input = QLineEdit()
+        bar = QHBoxLayout()
+        self.prompt_input  = QLineEdit()
         self.prompt_input.setPlaceholderText("Entrez votre requête ici...")
-        self.submit_button = QPushButton("\u25b6  Exécuter Agent")
+        self.submit_button = QPushButton("▶  Exécuter Agent")
         self.submit_button.clicked.connect(self.start_agent_run)
         self.prompt_input.returnPressed.connect(self.start_agent_run)
-        input_hbox.addWidget(self.prompt_input)
-        input_hbox.addWidget(self.submit_button)
-        main_layout.addLayout(input_hbox)
+        bar.addWidget(self.prompt_input)
+        bar.addWidget(self.submit_button)
+        layout.addLayout(bar)
 
-        self.setCentralWidget(central_widget)
+        self.setCentralWidget(central)
 
+    # ------------------------------------------------------------------ chat helpers
+    def _append_colored(self, text: str, color: str):
+        """Ajoute du texte coloré dans le chat sans saut de ligne supplémentaire."""
+        cursor = self.log_output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(text)
+        self.log_output.setTextCursor(cursor)
+        self.log_output.ensureCursorVisible()
+
+    def _on_event(self, event_type: str, data: str):
+        """Reçoit chaque événement de l'orchestrateur et l'affiche dans le chat."""
+        color   = EVENT_COLORS.get(event_type, "#cccccc")
+        pattern = EVENT_PREFIX.get(event_type, "{data}")
+
+        if event_type == EVT_THINKING:
+            if not data:  # signal de début pensée
+                if self._thinking_started:
+                    return
+                self._thinking_started = True
+                self._append_colored("\n🤔 Pensée : ", "#888888")
+                return
+            # chunk token — affichage inline sans saut de ligne
+            self._append_colored(data, color)
+            return
+
+        # Pour tous les autres événements : on reset le flag thinking
+        self._thinking_started = False
+        text = pattern.format(data=data)
+        self._append_colored(text, color)
+
+    # ------------------------------------------------------------------ agent run
     def start_agent_run(self):
         prompt = self.prompt_input.text().strip()
         if not prompt:
-            QMessageBox.warning(self, "Attention", "Veuillez entrer une requête avant d'exécuter.")
+            QMessageBox.warning(self, "Attention", "Entrez une requête.")
             return
 
-        provider = self._build_provider()
+        provider      = self._build_provider()
         provider_name = self.provider_combo.currentText()
-        model_name = self.model_input.text().strip() or self.model_input.placeholderText()
+        model_name    = self.model_input.text().strip() or self.model_input.placeholderText()
 
         self.submit_button.setEnabled(False)
         self.prompt_input.setEnabled(False)
-        self.log_output.append(f"\n\U0001f50c Provider : {provider_name} | Modèle : {model_name}")
-        self.log_output.append("... Lancement du cycle agentique ...")
+        self._thinking_started = False
+
+        self._append_colored(
+            f"\n\n🗨️ Vous : {prompt}\n🔌 {provider_name} | {model_name}\n",
+            "#aaaaaa"
+        )
 
         self.worker = LLMWorker(prompt, provider, self.dispatcher)
-        self.worker.log_signal.connect(self.update_log)
-        self.worker.finished_signal.connect(self.run_finished)
+        self.worker.event_signal.connect(self._on_event)
+        self.worker.finished_signal.connect(self._run_finished)
         self.worker.start()
 
-    def update_log(self, message: str):
-        self.log_output.append(message + "\n")
-
-    def run_finished(self, success: bool, status_message: str):
+    def _run_finished(self, success: bool, error: str):
         self.submit_button.setEnabled(True)
         self.prompt_input.setEnabled(True)
+        self.prompt_input.clear()
+        self._thinking_started = False
 
         if success:
-            self.log_output.append("===============================")
-            self.log_output.append("\u2705 Cycle agentique terminé avec succès.")
+            self._append_colored("\n═" * 40 + "\n", "#444444")
         else:
-            self.log_output.setStyleSheet("color: red;")
-            self.log_output.append(f"\u274c Échec : {status_message}")
-            QTimer.singleShot(3000, lambda: self.log_output.setStyleSheet(""))
-
-        self.log_output.append("===============================\n")
+            self._append_colored(f"\n❌ Échec : {error}\n", "#ef5350")
 
 
 def main():
