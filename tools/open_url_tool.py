@@ -4,18 +4,17 @@ import webbrowser
 class OpenUrlTool:
     """
     Ouvre une URL dans le navigateur par défaut du système.
-    Utilise uniquement la bibliothèque standard Python (webbrowser).
+    Retourne un message éxplicite DONE pour que le LLM sache que la tâche est terminée.
     """
 
     def open_url(self, url: str) -> str:
-        """
-        Ouvre l'URL donnée dans le navigateur par défaut.
-        Retourne un message de confirmation.
-        """
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         try:
             webbrowser.open(url)
-            return f"[OK] Navigateur ouvert sur : {url}"
+            return (
+                f"[DONE] Le navigateur a été ouvert sur : {url}\n"
+                "La tâche est accomplie. Utilise maintenant 'final_answer'."
+            )
         except Exception as e:
             return f"[ERREUR open_url] {e}"
