@@ -1,103 +1,176 @@
 import json
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional
 
-# Imports corrigés : les providers sont dans providers/, pas dans tools/
 from providers.llm_provider_interface import LLMProvider
-from providers.openai_provider import OpenAIProvider
 from tools.tool_dispatcher import ToolDispatcher
 
+
+SYSTEM_PROMPT_TEMPLATE = """Tu es un agent IA autonome. Tu dois accomplir la tâche demandée en utilisant les outils disponibles.
+
+{tools_description}
+
+Mode de sécurité actif : {security_mode}{scope_info}
+
+Règles strictes :
+1. Réponds UNIQUEMENT en JSON valide, sans texte autour.
+2. Si tu dois utiliser un outil, réponds avec :
+   {{"action": "tool", "tool": "<nom_outil>", "params": {{...}}}}
+3. Si tu as la réponse finale, réponds avec :
+   {{"action": "final_answer", "answer": "<ta réponse complète>"}}
+4. En mode MONITORING, tu ne peux PAS utiliser d'outils. Donne directement une final_answer.
+
+Historique de la conversation :
+{history}
+
+Tâche : {task}"""
+
+
 class SecurityMode:
-    """Enum pour définir l'état de sécurité du système agentique."""
-    MONITORING = "MONITORING"        # Mode par défaut : tout est bloqué, uniquement visualisation des Intentions.
-    LIMITED_SCOPE = "LIMITED_SCOPE"  # Délimite les actions à un chemin donné (e.g., /optimisation).
-    FULL_CONTROL = "FULL_CONTROL"    # Risque maximal : Autorise toutes les opérations sans confirmation préalable (Usage réservé).
+    MONITORING = "MONITORING"
+    LIMITED_SCOPE = "LIMITED_SCOPE"
+    FULL_CONTROL = "FULL_CONTROL"
+
 
 class AgentOrchestrator:
     """
-    Central orchestrator for the ReAct loop, maintenant avec un gestionnaire de sécurité contextuel.
-    Il contrôle le cycle ReAct en fonction du mode défini par l'utilisateur/le système.
+    Orchestrateur ReAct réel : Pensée → Action → Observation, jusqu'à réponse finale.
     """
     def __init__(self, llm_provider: LLMProvider, dispatcher: ToolDispatcher):
         self.llm_provider = llm_provider
         self.dispatcher = dispatcher
-        # État de sécurité initial : Monitoring (le plus sûr)
         self.security_mode: str = SecurityMode.MONITORING
-        self.current_scope: Optional[str] = None # Scope pour LIMITED_SCOPE
+        self.current_scope: Optional[str] = None
+        self.chat_history: list = []
 
     def set_safety_mode(self, mode: str, scope: Optional[str] = None):
-        """Change le mode de sécurité et réinitialise les paramètres associés."""
         if mode not in [SecurityMode.MONITORING, SecurityMode.LIMITED_SCOPE, SecurityMode.FULL_CONTROL]:
-             raise ValueError("Mode de sécurité invalide.")
-
+            raise ValueError(f"Mode de sécurité invalide : {mode}")
         self.security_mode = mode
         self.current_scope = scope
-        print(f"*** 🛡️ MODE SÉCURITÉ PASSE À : {mode} {' (Scope: ' + (scope or 'N/A') + ')' if scope else ''} ***")
+        print(f"*** 🛡️ MODE SÉCURITÉ : {mode}{' | Scope: ' + scope if scope else ''} ***")
 
-
-    def _check_security(self, action: str, tool_name: str, params: Dict[str, Any]) -> bool:
-        """Vérifie si l'action est autorisée selon le mode actuel."""
+    def _check_security(self, tool_name: str, params: Dict[str, Any]) -> tuple[bool, str]:
+        """Retourne (autorisé, message_erreur)."""
         if self.security_mode == SecurityMode.MONITORING:
-            print("🛑 BLOCKER PAR SÉCURITÉ: Le système est en MODE SURVEILLANCE. Aucune action n'est permise.")
-            return False
+            return False, "🛑 Action bloquée : mode MONITORING actif."
 
-        elif self.security_mode == SecurityMode.LIMITED_SCOPE:
-            if 'file_path' in params and not str(params['file_path']).startswith(self.current_scope):
-                print(f"🛑 BLOCKER PAR SCOPE: L'opération doit rester dans {self.current_scope}, mais cible un fichier externe.")
-                return False
+        if self.security_mode == SecurityMode.LIMITED_SCOPE and self.current_scope:
+            path = params.get('file_path') or params.get('directory', '')
+            if path and not str(path).startswith(self.current_scope):
+                return False, f"🛑 Action bloquée : le chemin '{path}' est hors du scope '{self.current_scope}'."
 
-        elif self.security_mode == SecurityMode.FULL_CONTROL:
-            return True
+        return True, ""
 
-        return True
+    def _build_system_prompt(self, task: str) -> str:
+        history_text = ""
+        for msg in self.chat_history:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "assistant":
+                history_text += f"Agent: {content}\n"
+            elif role == "tool":
+                history_text += f"Observation: {content}\n"
 
+        scope_info = f" | Scope limité : {self.current_scope}" if self.current_scope else ""
+        return SYSTEM_PROMPT_TEMPLATE.format(
+            tools_description=self.dispatcher.get_tools_description(),
+            security_mode=self.security_mode,
+            scope_info=scope_info,
+            history=history_text or "(aucun historique)",
+            task=task
+        )
+
+    def _parse_llm_response(self, raw: str) -> Optional[Dict]:
+        """Extrait le JSON de la réponse brute du LLM (qui peut contenir du texte autour)."""
+        raw = raw.strip()
+        # Chercher un bloc JSON entre accolades
+        start = raw.find('{')
+        end = raw.rfind('}') + 1
+        if start == -1 or end == 0:
+            return None
+        try:
+            return json.loads(raw[start:end])
+        except json.JSONDecodeError:
+            return None
 
     def run_agentic_cycle(self, initial_prompt: str, max_steps: int = 8) -> Optional[str]:
         """
-        Exécute la boucle ReAct avec vérifications de sécurité intégrées.
+        Boucle ReAct réelle :
+          1. Construire le prompt système avec contexte + historique
+          2. Appeler le LLM
+          3. Parser la réponse JSON
+          4a. Si action=tool : vérifier sécurité, exécuter, ajouter observation à l'historique
+          4b. Si action=final_answer : retourner la réponse
+          5. Recommencer jusqu'à max_steps
         """
-        print("\n\n#################################################")
-        print(f"### STARTING AGENT CYCLE | Mode Actif: {self.security_mode} ###")
+        print("\n#################################################")
+        print(f"### AGENT CYCLE | Mode: {self.security_mode} | Max steps: {max_steps} ###")
         print("#################################################\n")
 
-        self.chat_history = []
-        user_prompt_message = {"role": "user", "content": initial_prompt}
-        self.chat_history.append(user_prompt_message)
-
-        final_answer = None  # Initialisation pour éviter UnboundLocalError
+        # Ne pas réinitialiser l'historique pour préserver le contexte entre appels
+        task = initial_prompt
 
         for step in range(max_steps):
-            print(f"\n===================== ÉTAPE {step + 1}/{max_steps} ===================")
+            print(f"\n===== ÉTAPE {step + 1}/{max_steps} =====")
 
-            print("-> 🤖 [Pensée]: Attente de la décision de l'Agent...")
+            # --- PHASE 1 : Construction du prompt ---
+            system_prompt = self._build_system_prompt(task)
 
-            raw_llm_output = self.llm_provider.stream_response(initial_prompt, [user_prompt_message])
-            # ... (Le reste du parsing/simulation doit être ici) ...
+            # --- PHASE 2 : Appel LLM (collecte du stream en chaîne complète) ---
+            print("🤖 [Pensée] Interrogation du LLM...")
+            raw_chunks = []
+            for chunk in self.llm_provider.stream_response(system_prompt, []):
+                raw_chunks.append(chunk)
+            raw_response = "".join(raw_chunks).strip()
+            print(f"   Réponse brute : {raw_response[:200]}{'...' if len(raw_response) > 200 else ''}")
 
-            if step == 0:
-                action_to_take = {
-                    "tool": "find_files",
-                    "params": {"pattern": "*.json", "directory": "G:\\optimisation"}
-                }
+            self.chat_history.append({"role": "assistant", "content": raw_response})
 
-                if not self._check_security("Find Files", "find_files", action_to_take['params']):
-                    observation = "[SECURITY BLOCKED] L'action est bloquée par le mode de sécurité."
+            # --- PHASE 3 : Parsing JSON ---
+            parsed = self._parse_llm_response(raw_response)
+
+            if not parsed:
+                # LLM n'a pas suivi le format JSON — on enregistre et on réessaie
+                print("⚠️ Réponse non JSON, nouvelle tentative...")
+                self.chat_history.append({
+                    "role": "tool",
+                    "content": "[FORMAT ERROR] Ta réponse doit être un JSON valide avec 'action' et 'tool'/'answer'."
+                })
+                continue
+
+            action = parsed.get("action")
+
+            # --- PHASE 4a : Réponse finale ---
+            if action == "final_answer":
+                answer = parsed.get("answer", "")
+                print(f"✅ Réponse finale obtenue après {step + 1} étape(s).")
+                return answer
+
+            # --- PHASE 4b : Appel d'outil ---
+            elif action == "tool":
+                tool_name = parsed.get("tool", "")
+                params = parsed.get("params", {})
+
+                print(f"🔧 [Action] Outil demandé : {tool_name} | Params : {params}")
+
+                # Vérification sécurité
+                allowed, reason = self._check_security(tool_name, params)
+                if not allowed:
+                    observation = reason
+                    print(f"   {reason}")
                 else:
-                    print(f"   (Simulation): Sécurité OK. Appel au dispatcher...")
-                    observation = self.dispatcher.dispatch_call(
-                        tool_name=action_to_take["tool"],
-                        **action_to_take["params"]
-                    )
+                    observation = self.dispatcher.dispatch_call(tool_name=tool_name, **params)
+
+                print(f"📍 [Observation] {str(observation)[:300]}")
+                self.chat_history.append({"role": "tool", "content": str(observation)})
 
             else:
-                observation = "Continuation du processus..."
+                # Action inconnue — on informe le LLM
+                self.chat_history.append({
+                    "role": "tool",
+                    "content": f"[ERREUR] Action '{action}' inconnue. Utilise 'tool' ou 'final_answer'."
+                })
 
-            self.chat_history.append({"role": "tool", "content": f"Resultat: {observation}"})
-
-            if step == 1:
-                final_answer = "[Agentic Cycle Completed] L'analyse des fichiers JSON montre un plan détaillé et une approche structurée pour l'implémentation."
-                break
-
-        print("=======================================")
-        return final_answer
-
-# ... (Le reste du bloc if __name__ == '__main__': de démonstration doit être adapté)
+        # Max steps atteint sans final_answer
+        print("⚠️ Nombre maximum d'étapes atteint sans réponse finale.")
+        return "[TIMEOUT] L'agent n'a pas pu terminer la tâche dans le nombre d'étapes autorisé."
