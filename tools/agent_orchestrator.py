@@ -15,10 +15,9 @@ Règles strictes :
 1. Réponds UNIQUEMENT en JSON valide, sans texte autour.
 2. Si tu dois utiliser un outil, réponds avec :
    {{"action": "tool", "tool": "<nom_outil>", "params": {{...}}}}
-3. Si tu as la réponse finale OU si l'observation indique [DONE], réponds IMMEDÉIATEMENT avec :
+3. Si tu as la réponse finale OU si l'observation indique [DONE], réponds IMMÉDIATEMENT avec :
    {{"action": "final_answer", "answer": "<ta réponse complète>"}}
-4. N'appelle JAMAIS deux fois le même outil avec les mêmes paramètres.
-5. En mode MONITORING, tu ne peux PAS utiliser d'outils. Donne directement une final_answer.
+4. En mode MONITORING, tu ne peux PAS utiliser d'outils. Donne directement une final_answer.
 
 Historique de la conversation :
 {history}
@@ -44,11 +43,11 @@ class SecurityMode:
 
 # Outils autorisés par mode
 ALLOWED_TOOLS: Dict[str, set] = {
-    SecurityMode.MONITORING: set(),  # aucun outil
-    SecurityMode.LIMITED_SCOPE: {    # outils fichiers uniquement (dans le scope)
+    SecurityMode.MONITORING: set(),
+    SecurityMode.LIMITED_SCOPE: {
         "read_file", "write_file", "find_files"
     },
-    SecurityMode.FULL_CONTROL: {     # tout
+    SecurityMode.FULL_CONTROL: {
         "read_file", "write_file", "find_files",
         "command_line_execute", "open_url", "web_scrape"
     },
@@ -82,19 +81,16 @@ class AgentOrchestrator:
         self.current_scope = scope
 
     def _check_security(self, tool_name: str, params: Dict[str, Any]) -> tuple[bool, str]:
-        """Vérifie (1) whitelist d'outils, (2) scope de chemin si LIMITED_SCOPE."""
         allowed_set = ALLOWED_TOOLS.get(self.security_mode, set())
 
-        # --- Whitelist d'outils
         if tool_name not in allowed_set:
             if self.security_mode == SecurityMode.MONITORING:
-                return False, f"🛑 Action bloquée : mode MONITORING actif."
+                return False, "🛑 Action bloquée : mode MONITORING actif."
             return False, (
                 f"🛑 Outil '{tool_name}' non autorisé en mode {self.security_mode}. "
                 f"Outils disponibles : {', '.join(sorted(allowed_set)) or 'aucun'}."
             )
 
-        # --- Vérification du scope chemin (LIMITED_SCOPE uniquement)
         if self.security_mode == SecurityMode.LIMITED_SCOPE and self.current_scope:
             path = params.get('file_path') or params.get('directory', '')
             if path and not str(path).startswith(self.current_scope):
@@ -141,7 +137,6 @@ class AgentOrchestrator:
 
             system_prompt = self._build_system_prompt(task)
 
-            # Streaming LLM chunk par chunk
             self._emit(EVT_THINKING, "")
             raw_chunks = []
             for chunk in self.llm_provider.stream_response(system_prompt, []):
@@ -154,8 +149,7 @@ class AgentOrchestrator:
             parsed = self._parse_llm_response(raw_response)
 
             if not parsed:
-                msg = "[FORMAT] Réponse non-JSON, nouvelle tentative..."
-                self._emit(EVT_WARNING, msg)
+                self._emit(EVT_WARNING, "[FORMAT] Réponse non-JSON, nouvelle tentative...")
                 self.chat_history.append({"role": "tool",
                     "content": "[FORMAT ERROR] Réponds UNIQUEMENT en JSON valide."})
                 continue
@@ -179,7 +173,6 @@ class AgentOrchestrator:
                 else:
                     observation = self.dispatcher.dispatch_call(tool_name=tool_name, **params)
 
-                # Si l'observation signale DONE → forcer final_answer à l'étape suivante
                 if "[DONE]" in str(observation):
                     observation += "\n[INSTRUCTION] Tâche accomplie. Réponds immédiatement avec 'final_answer'."
 
@@ -187,8 +180,7 @@ class AgentOrchestrator:
                 self.chat_history.append({"role": "tool", "content": str(observation)})
 
             else:
-                msg = f"[ERREUR] Action '{action}' inconnue."
-                self._emit(EVT_WARNING, msg)
+                self._emit(EVT_WARNING, f"[ERREUR] Action '{action}' inconnue.")
                 self.chat_history.append({"role": "tool",
                     "content": f"Action '{action}' inconnue. Utilise 'tool' ou 'final_answer'."})
 
