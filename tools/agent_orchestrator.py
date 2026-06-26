@@ -45,6 +45,11 @@ EVT_STEP     = "step"
 EVT_WARNING  = "warning"
 EVT_SECURITY = "security"
 
+# Nombre de caractères affichés dans le log UI pour une observation
+OBS_UI_MAX   = 2000
+# Nombre de caractères transmis dans l'historique LLM pour une observation brute
+OBS_LLM_MAX  = 4000
+
 
 class SecurityMode:
     MONITORING    = "MONITORING"
@@ -67,11 +72,41 @@ ALLOWED_TOOLS: Dict[str, set] = {
     },
 }
 
-# Outils dont l'observation doit être affichée mais qui ne stoppent PAS le cycle.
 INFO_TOOLS: set = {
     "browser_navigate", "browser_new_tab", "browser_click",
     "browser_fill", "browser_screenshot", "open_url",
 }
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Supprime les blocs <think>...</think> générés par certains modèles (ex: qwen3)."""
+    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+
+def _compact_github_repos(raw: str) -> str:
+    """
+    Si la réponse ressemble à un tableau JSON de repos GitHub, retourne
+    une liste compacte nom | description au lieu du JSON brut verbeux.
+    Sinon retourne raw intact.
+    """
+    raw_stripped = raw.strip()
+    if not raw_stripped.startswith('['):
+        return raw
+    try:
+        repos = json.loads(raw_stripped)
+        if not isinstance(repos, list) or not repos:
+            return raw
+        if not isinstance(repos[0], dict) or 'name' not in repos[0]:
+            return raw
+        lines = []
+        for r in repos:
+            name = r.get('name', '')
+            desc = r.get('description') or '(pas de description)'
+            url  = r.get('html_url', '')
+            lines.append(f"- {name} : {desc}  ({url})")
+        return "Repos GitHub :\n" + "\n".join(lines)
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return raw
 
 
 class AgentOrchestrator:
@@ -132,9 +167,10 @@ class AgentOrchestrator:
     def _parse_llm_response(self, raw: str) -> tuple[Optional[Dict], bool]:
         """
         Extrait le PREMIER objet JSON valide de la réponse.
+        Strippes les blocs <think> avant parsing pour éviter les faux positifs.
         Retourne (parsed, had_multiple) où had_multiple=True si plusieurs JSON détectés.
         """
-        raw = raw.strip()
+        raw = _strip_think_blocks(raw)
         candidates = [m.start() for m in re.finditer(r'\{', raw)]
         had_multiple = False
         first_parsed = None
@@ -215,30 +251,35 @@ class AgentOrchestrator:
                 allowed, reason = self._check_security(tool_name, params)
                 if not allowed:
                     self._emit(EVT_SECURITY, reason)
-                    observation = reason + "\nUtilise 'final_answer' pour expliquer à l'utilisateur."
-                else:
-                    observation = self.dispatcher.dispatch_call(tool_name=tool_name, **params)
+                    obs_for_llm = reason + "\nUtilise 'final_answer' pour expliquer à l'utilisateur."
+                    self._emit(EVT_OBSERVE, obs_for_llm[:OBS_UI_MAX])
+                    self.chat_history.append({"role": "tool", "content": obs_for_llm})
+                    continue
 
+                observation = self.dispatcher.dispatch_call(tool_name=tool_name, **params)
                 obs_str = str(observation)
 
-                # Bug E : après un [DONE], inviter à appeler final_answer si c'était la dernière action
-                if obs_str.startswith("[DONE]"):
-                    obs_str = (
-                        obs_str +
+                # Compacter les réponses JSON verbeux (repos GitHub, etc.)
+                obs_compact = _compact_github_repos(obs_str)
+
+                # Hints selon le préfixe
+                if obs_compact.startswith("[DONE]"):
+                    obs_for_llm = (
+                        obs_compact +
                         "\n→ Action réussie. Si toutes les tâches demandées sont terminées, "
                         "appelle final_answer maintenant."
                     )
-
-                # Bug D / correction 3 : enrichir l'observation d'erreur
-                if obs_str.startswith("[ERREUR]"):
-                    obs_str = (
-                        obs_str +
+                elif obs_compact.startswith("[ERREUR]"):
+                    obs_for_llm = (
+                        obs_compact +
                         "\n→ Cet outil a échoué. Utilise un outil DIFFÉRENT ou appelle "
                         "final_answer pour expliquer l'échec. Ne répète PAS la même commande."
                     )
+                else:
+                    obs_for_llm = obs_compact
 
-                self._emit(EVT_OBSERVE, obs_str[:500])
-                self.chat_history.append({"role": "tool", "content": obs_str})
+                self._emit(EVT_OBSERVE, obs_for_llm[:OBS_UI_MAX])
+                self.chat_history.append({"role": "tool", "content": obs_for_llm[:OBS_LLM_MAX]})
 
             else:
                 self._emit(EVT_WARNING, f"[ERREUR] Action '{action}' inconnue.")
