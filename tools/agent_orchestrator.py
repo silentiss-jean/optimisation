@@ -15,7 +15,7 @@ Règles strictes :
 1. Réponds UNIQUEMENT en JSON valide, sans texte autour.
 2. Si tu dois utiliser un outil, réponds avec :
    {{"action": "tool", "tool": "<nom_outil>", "params": {{...}}}}
-3. Si tu as la réponse finale OU si l'observation indique [DONE], réponds IMMEDÉATEMENT avec :
+3. Si tu as la réponse finale, réponds IMMEDÉATEMENT avec :
    {{"action": "final_answer", "answer": "<ta réponse complète>"}}
 4. En mode MONITORING, tu ne peux PAS utiliser d'outils. Donne directement une final_answer.
 5. Pour les actions navigateur, commence toujours par browser_navigate avant browser_click/fill/get_text.
@@ -57,6 +57,12 @@ ALLOWED_TOOLS: Dict[str, set] = {
         "browser_navigate", "browser_click", "browser_fill",
         "browser_screenshot", "browser_get_text",
     },
+}
+
+# Outils dont [DONE] dans l'observation signifie tâche accomplie → sortie immédiate
+DONE_TRIGGERS: set = {
+    "browser_navigate", "browser_click", "browser_fill",
+    "browser_screenshot", "open_url",
 }
 
 
@@ -135,6 +141,23 @@ class AgentOrchestrator:
         except json.JSONDecodeError:
             return None
 
+    def _make_done_answer(self, tool_name: str, params: Dict[str, Any],
+                          observation: str) -> str:
+        """Construit une final_answer lisible quand [DONE] est détecté côté Python."""
+        if tool_name == "browser_navigate":
+            url = observation.split("Navigé vers :")[-1].strip()
+            return f"Le navigateur a été ouvert sur : {url}"
+        if tool_name == "browser_click":
+            return f"Clic effectué sur '{params.get('selector', '')}'."
+        if tool_name == "browser_fill":
+            return f"Champ '{params.get('selector', '')}' rempli."
+        if tool_name == "browser_screenshot":
+            path = params.get('save_path', 'screenshot.png')
+            return f"Capture d'écran sauvegardée : {path}"
+        if tool_name == "open_url":
+            return f"URL ouverte : {params.get('url', '')}"
+        return observation.replace("[DONE]", "").strip()
+
     def run_agentic_cycle(self, initial_prompt: str, max_steps: int = 8) -> Optional[str]:
         task = initial_prompt
 
@@ -179,11 +202,14 @@ class AgentOrchestrator:
                 else:
                     observation = self.dispatcher.dispatch_call(tool_name=tool_name, **params)
 
-                if "[DONE]" in str(observation):
-                    observation += "\n[INSTRUCTION] Tâche accomplie. Réponds immédiatement avec 'final_answer'."
-
                 self._emit(EVT_OBSERVE, str(observation)[:500])
                 self.chat_history.append({"role": "tool", "content": str(observation)})
+
+                # Sortie immédiate côté Python — ne repasse pas par le LLM
+                if "[DONE]" in str(observation) and tool_name in DONE_TRIGGERS:
+                    answer = self._make_done_answer(tool_name, params, str(observation))
+                    self._emit(EVT_ANSWER, answer)
+                    return answer
 
             else:
                 self._emit(EVT_WARNING, f"[ERREUR] Action '{action}' inconnue.")
