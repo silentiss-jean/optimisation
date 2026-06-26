@@ -1,11 +1,13 @@
 import sys
 import os
+import json
+import urllib.request
 from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QLineEdit, QLabel, QMessageBox,
     QComboBox, QGroupBox, QFormLayout, QRadioButton, QButtonGroup,
-    QFileDialog, QDialog, QDialogButtonBox
+    QFileDialog, QDialog, QDialogButtonBox, QStackedWidget
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat
@@ -30,9 +32,18 @@ PROVIDER_DEFAULTS = {
     "Perplexity (Sonar)": "sonar",
 }
 CLOUD_PROVIDERS = {"OpenAI / OpenRouter (cloud)", "Perplexity (Sonar)"}
+LOCAL_PROVIDERS = {"Ollama (local)", "LM Studio (local)"}
 API_KEY_HINTS = {
     "OpenAI / OpenRouter (cloud)": "sk-... (ou via OPENAI_API_KEY)",
-    "Perplexity (Sonar)": "pplx-... → console.perplexity.ai",
+    "Perplexity (Sonar)": "pplx-... \u2192 console.perplexity.ai",
+}
+
+# Endpoints pour lister les mod\u00e8les locaux
+MODEL_LIST_ENDPOINTS = {
+    "Ollama (local)": ("http://localhost:11434/api/tags",
+                       lambda d: [m["name"] for m in d.get("models", [])]),
+    "LM Studio (local)": ("http://localhost:1234/v1/models",
+                           lambda d: [m["id"] for m in d.get("data", [])]),
 }
 
 # ─────────────────────────────────────────────────── streaming colors
@@ -61,30 +72,29 @@ SECURITY_BADGE = {
     SecurityMode.FULL_CONTROL:  ("FULL CONTROL \u2014 acc\u00e8s total",    "#2a1a1a", "#ef5350"),
 }
 
-# Durées de confiance FULL CONTROL
+# Dur\u00e9es de confiance FULL CONTROL
 TRUST_DURATIONS = [
-    ("Cette requête uniquement",   None),
+    ("Cette requ\u00eate uniquement",   None),
     ("1 heure",                    timedelta(hours=1)),
-    ("Jusqu'à demain minuit",      None),   # calculé dynamiquement
-    ("Cette session",              timedelta(days=3650)),  # "infini" pratique
+    ("Jusqu'\u00e0 demain minuit",      None),
+    ("Cette session",              timedelta(days=3650)),
 ]
 
 
 # ═══════════════════════════════════════════════════ Dialog de confiance
 class TrustDialog(QDialog):
-    """Popup FULL CONTROL avec choix de durée."""
+    """Popup FULL CONTROL avec choix de dur\u00e9e."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("🟢 FULL CONTROL — Confirmation")
+        self.setWindowTitle("\U0001f7e2 FULL CONTROL \u2014 Confirmation")
         self.setMinimumWidth(420)
-        self.selected_duration = None   # timedelta ou None (requête seule)
+        self.selected_duration = None
 
         layout = QVBoxLayout(self)
-
         layout.addWidget(QLabel(
-            "<b>L'agent aura accès TOTAL au système</b><br>"
+            "<b>L'agent aura acc\u00e8s TOTAL au syst\u00e8me</b><br>"
             "(fichiers, commandes OS, web).<br><br>"
-            "Pendant combien de temps accorder l'accès ?"
+            "Pendant combien de temps accorder l'acc\u00e8s ?"
         ))
 
         self.btn_group = QButtonGroup(self)
@@ -114,7 +124,7 @@ class TrustDialog(QDialog):
             ) + timedelta(days=1)
             self.selected_duration = tomorrow - datetime.now()
         else:
-            self.selected_duration = delta   # None = cette requête seulement
+            self.selected_duration = delta
         self.accept()
 
 
@@ -156,14 +166,46 @@ class MainWindow(QMainWindow):
         self.setGeometry(100, 100, 1260, 900)
         self.dispatcher        = ToolDispatcher()
         self._thinking_started = False
-        # Session de confiance FULL CONTROL
-        self._trust_expiry: datetime | None = None   # None = pas de session active
+        self._trust_expiry: datetime | None = None
         self._setup_ui()
 
-    # ──────────────────────────────────────────────── build provider
+    # ──────────────────────────────── fetch models from local server
+    def _fetch_local_models(self):
+        """GET l'API locale du provider s\u00e9lectionn\u00e9 et remplit le combo mod\u00e8les."""
+        choice = self.provider_combo.currentText()
+        if choice not in MODEL_LIST_ENDPOINTS:
+            return
+        url, extractor = MODEL_LIST_ENDPOINTS[choice]
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+            models = extractor(data)
+            if not models:
+                QMessageBox.information(self, "Mod\u00e8les", "Aucun mod\u00e8le trouv\u00e9 (liste vide).")
+                return
+            current = self.model_combo.currentText()
+            self.model_combo.clear()
+            self.model_combo.addItems(models)
+            # Restaurer la s\u00e9lection pr\u00e9c\u00e9dente si toujours dans la liste
+            if current in models:
+                self.model_combo.setCurrentText(current)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Connexion impossible",
+                f"Impossible de joindre {url}\n\n{e}\n\n"
+                f"V\u00e9rifiez que {choice} est bien d\u00e9marr\u00e9."
+            )
+
+    # ──────────────────────────────── build provider
     def _build_provider(self) -> LLMProvider:
         choice = self.provider_combo.currentText()
-        model  = self.model_input.text().strip()
+        # Mod\u00e8le : combo pour local, texte pour cloud
+        if choice in LOCAL_PROVIDERS:
+            model = self.model_combo.currentText().strip()
+        else:
+            model = self.model_input.text().strip()
+
         if choice == "Ollama (local)":
             return OllamaProvider(model=model or "qwen3:8b")
         elif choice == "LM Studio (local)":
@@ -184,13 +226,24 @@ class MainWindow(QMainWindow):
     def _on_provider_changed(self, _index: int):
         choice   = self.provider_combo.currentText()
         is_cloud = choice in CLOUD_PROVIDERS
+        is_local = choice in LOCAL_PROVIDERS
+
+        # Afficher combo ou input selon le type
+        self.model_stack.setCurrentIndex(0 if is_local else 1)
+
         self.apikey_label.setVisible(is_cloud)
         self.apikey_input.setVisible(is_cloud)
+        self.refresh_btn.setVisible(is_local)
+
         if is_cloud:
             self.apikey_input.setPlaceholderText(API_KEY_HINTS.get(choice, ""))
             self.apikey_input.clear()
-        self.model_input.setPlaceholderText(PROVIDER_DEFAULTS.get(choice, ""))
-        self.model_input.clear()
+            self.model_input.setPlaceholderText(PROVIDER_DEFAULTS.get(choice, ""))
+            self.model_input.clear()
+        else:
+            # R\u00e9initialiser le combo avec le default
+            self.model_combo.clear()
+            self.model_combo.addItem(PROVIDER_DEFAULTS.get(choice, ""))
 
     # ─────────────────────────────────────────────── security UI
     def _current_security_mode(self) -> str:
@@ -202,7 +255,6 @@ class MainWindow(QMainWindow):
 
     def _on_security_changed(self):
         mode = self._current_security_mode()
-        # Révoquer la session de confiance si on quitte FULL CONTROL
         if mode != SecurityMode.FULL_CONTROL:
             self._trust_expiry = None
             self._update_trust_badge()
@@ -218,16 +270,14 @@ class MainWindow(QMainWindow):
         self.scope_browse.setVisible(show_scope)
 
     def _is_trust_active(self) -> bool:
-        """Retourne True si une session de confiance FULL CONTROL est encore valide."""
         if self._trust_expiry is None:
             return False
         return datetime.now() < self._trust_expiry
 
     def _update_trust_badge(self):
-        """Affiche/masque le badge de session de confiance active."""
         if self._is_trust_active():
             expiry_str = self._trust_expiry.strftime("%H:%M")
-            self.trust_label.setText(f"  ✅ Session de confiance active jusqu'à {expiry_str}  ")
+            self.trust_label.setText(f"  \u2705 Session de confiance active jusqu'\u00e0 {expiry_str}  ")
             self.trust_label.setStyleSheet(
                 "background-color:#1a2a1a; color:#81c784; "
                 "font-size:11px; border-radius:4px; padding:2px 6px;"
@@ -260,9 +310,33 @@ class MainWindow(QMainWindow):
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         cfg_layout.addRow("Provider :", self.provider_combo)
 
+        # ---- Widget empilement : combo (local) ou QLineEdit (cloud)
+        self.model_stack = QStackedWidget()
+        self.model_stack.setFixedHeight(32)
+
+        # Page 0 : combo + bouton refresh pour providers locaux
+        local_widget = QWidget()
+        local_layout = QHBoxLayout(local_widget)
+        local_layout.setContentsMargins(0, 0, 0, 0)
+        local_layout.setSpacing(4)
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(True)          # saisie libre aussi possible
+        self.model_combo.addItem("qwen3:8b")        # default Ollama
+        self.refresh_btn = QPushButton("\U0001f504")
+        self.refresh_btn.setFixedWidth(32)
+        self.refresh_btn.setToolTip("Actualiser la liste des mod\u00e8les disponibles")
+        self.refresh_btn.clicked.connect(self._fetch_local_models)
+        local_layout.addWidget(self.model_combo)
+        local_layout.addWidget(self.refresh_btn)
+        self.model_stack.addWidget(local_widget)    # index 0
+
+        # Page 1 : QLineEdit pour cloud
         self.model_input = QLineEdit()
-        self.model_input.setPlaceholderText("qwen3:8b")
-        cfg_layout.addRow("Mod\u00e8le :", self.model_input)
+        self.model_input.setPlaceholderText("gpt-3.5-turbo")
+        self.model_stack.addWidget(self.model_input)  # index 1
+
+        self.model_stack.setCurrentIndex(0)           # Ollama par d\u00e9faut
+        cfg_layout.addRow("Mod\u00e8le :", self.model_stack)
 
         self.apikey_label = QLabel("Cl\u00e9 API :")
         self.apikey_input = QLineEdit()
@@ -274,7 +348,7 @@ class MainWindow(QMainWindow):
         cfg_group.setLayout(cfg_layout)
         top_row.addWidget(cfg_group, stretch=1)
 
-        # ---- Sécurité group
+        # ---- S\u00e9curit\u00e9 group
         sec_group  = QGroupBox("\U0001f6e1\ufe0f Mode S\u00e9curit\u00e9")
         sec_layout = QVBoxLayout()
         sec_layout.setSpacing(6)
@@ -283,7 +357,6 @@ class MainWindow(QMainWindow):
         self.security_badge.setFixedHeight(28)
         sec_layout.addWidget(self.security_badge)
 
-        # Badge session de confiance
         self.trust_label = QLabel()
         self.trust_label.setFixedHeight(22)
         self.trust_label.setVisible(False)
@@ -338,7 +411,8 @@ class MainWindow(QMainWindow):
         )
         self._append_colored(
             "Bienvenue dans l'Optimisation AI Agent.\n"
-            "S\u00e9lectionnez un provider et un mode s\u00e9curit\u00e9, puis lancez votre requ\u00eate.",
+            "S\u00e9lectionnez un provider et un mode s\u00e9curit\u00e9, puis lancez votre requ\u00eate.\n"
+            "Cliquez \U0001f504 pour charger les mod\u00e8les disponibles du provider local.",
             "#888888"
         )
         root.addWidget(self.log_output)
@@ -394,24 +468,26 @@ class MainWindow(QMainWindow):
         mode  = self._current_security_mode()
         scope = self.scope_input.text().strip() if mode == SecurityMode.LIMITED_SCOPE else ""
 
-        # Confirmation FULL CONTROL — ignorée si session active
         if mode == SecurityMode.FULL_CONTROL and not self._is_trust_active():
             dlg = TrustDialog(self)
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             duration = dlg.selected_duration
             if duration is not None:
-                # Session de confiance avec durée
                 self._trust_expiry = datetime.now() + duration
                 self._update_trust_badge()
             else:
-                # Requête seule : pas de session persistante
                 self._trust_expiry = None
 
         provider      = self._build_provider()
         provider_name = self.provider_combo.currentText()
-        model_name    = self.model_input.text().strip() or self.model_input.placeholderText()
-        badge_label   = SECURITY_BADGE[mode][0]
+        # Nom du mod\u00e8le affich\u00e9 selon type
+        choice = self.provider_combo.currentText()
+        if choice in LOCAL_PROVIDERS:
+            model_name = self.model_combo.currentText().strip()
+        else:
+            model_name = self.model_input.text().strip() or self.model_input.placeholderText()
+        badge_label = SECURITY_BADGE[mode][0]
 
         self.submit_button.setEnabled(False)
         self.prompt_input.setEnabled(False)
