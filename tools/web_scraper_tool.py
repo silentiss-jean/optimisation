@@ -18,7 +18,7 @@ class WebScraperTool(Tool):
 
     def execute(self, url: str, **kwargs) -> str:
         try:
-            response = requests.get(url, timeout=15)
+            response = requests.get(url, timeout=8)
             response.raise_for_status()
             try:
                 from bs4 import BeautifulSoup
@@ -27,6 +27,8 @@ class WebScraperTool(Tool):
             except ImportError:
                 return response.text[:3000]
         except requests.Timeout:
-            return f"[ERREUR] Timeout lors du scraping de {url}."
+            return f"[ERREUR] Timeout (8s) lors du scraping de {url}. Essaie une URL alternative."
+        except requests.ConnectionError:
+            return f"[ERREUR] Impossible de joindre {url} (connexion refusée ou DNS). Essaie une URL alternative."
         except Exception as e:
             return f"[ERREUR web_scrape] {e}"

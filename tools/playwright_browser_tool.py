@@ -2,7 +2,6 @@ import os
 from typing import Optional
 from .base_tool import Tool
 
-# Tentative d'import Playwright — fallback webbrowser si absent
 try:
     from playwright.sync_api import sync_playwright, Browser, Page
     PLAYWRIGHT_AVAILABLE = True
@@ -60,13 +59,11 @@ class _PlaywrightSession:
             _PlaywrightSession._instance = None
 
 
-# ─── Actions ─────────────────────────────────────────────────────────────────
-
 class BrowserNavigateTool(Tool):
     def __init__(self):
         super().__init__(
             name="browser_navigate",
-            description="Naviguer vers une URL dans le navigateur controllé (Playwright). Lance le navigateur si besoin.",
+            description="Naviguer vers une URL dans le navigateur contrôlé (Playwright). Lance le navigateur si besoin.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -82,16 +79,16 @@ class BrowserNavigateTool(Tool):
 
         session = _PlaywrightSession.get()
         if not session.start():
-            # Fallback webbrowser
             import webbrowser
             webbrowser.open(url)
             return f"[FALLBACK] Playwright indisponible. Ouvert via webbrowser : {url}"
 
         try:
-            session.page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            return f"[DONE] Navigué vers : {session.page.url}"
+            session.page.goto(url, wait_until="domcontentloaded", timeout=8000)
+            return f"[DONE] Navigé vers : {session.page.url}"
         except Exception as e:
-            return f"[ERREUR browser_navigate] {e}"
+            err = str(e).split("\n")[0]  # 1 seule ligne, pas le call log complet
+            return f"[ERREUR browser_navigate] {err}. Essaie une URL alternative."
 
 
 class BrowserClickTool(Tool):
@@ -116,7 +113,7 @@ class BrowserClickTool(Tool):
             page.click(selector, timeout=8000)
             return f"[DONE] Cliqué sur '{selector}'."
         except Exception as e:
-            return f"[ERREUR browser_click] {e}"
+            return f"[ERREUR browser_click] {str(e).split(chr(10))[0]}"
 
 
 class BrowserFillTool(Tool):
@@ -140,9 +137,9 @@ class BrowserFillTool(Tool):
             return "[ERREUR] Aucune session navigateur active. Utilise browser_navigate d'abord."
         try:
             page.fill(selector, text, timeout=8000)
-            return f"[DONE] Champ '{selector}' rempli avec le texte fourni."
+            return f"[DONE] Champ '{selector}' rempli."
         except Exception as e:
-            return f"[ERREUR browser_fill] {e}"
+            return f"[ERREUR browser_fill] {str(e).split(chr(10))[0]}"
 
 
 class BrowserScreenshotTool(Tool):
@@ -171,7 +168,7 @@ class BrowserScreenshotTool(Tool):
             page.screenshot(path=abs_path, full_page=True)
             return f"[DONE] Screenshot sauvegardé : {abs_path}"
         except Exception as e:
-            return f"[ERREUR browser_screenshot] {e}"
+            return f"[ERREUR browser_screenshot] {str(e).split(chr(10))[0]}"
 
 
 class BrowserGetTextTool(Tool):
@@ -202,10 +199,9 @@ class BrowserGetTextTool(Tool):
                 text = page.locator("body").inner_text()
             return text[:3000]
         except Exception as e:
-            return f"[ERREUR browser_get_text] {e}"
+            return f"[ERREUR browser_get_text] {str(e).split(chr(10))[0]}"
 
 
-# Groupe pour ToolDispatcher
 class PlaywrightBrowserTool:
     """Groupe les 5 actions Playwright pour l'enregistrement dans ToolDispatcher."""
     def __init__(self):

@@ -19,6 +19,11 @@ Règles strictes :
    {{"action": "final_answer", "answer": "<ta réponse complète>"}}
 4. En mode MONITORING, tu ne peux PAS utiliser d'outils. Donne directement une final_answer.
 5. Pour les actions navigateur, commence toujours par browser_navigate avant browser_click/fill/get_text.
+6. Si un outil retourne [ERREUR] ou Timeout sur une URL, essaie OBLIGATOIREMENT une URL alternative 
+   avant de rendre une final_answer d'échec. Exemples d'alternatives :
+   - Météo Paris : essaie wttr.in/Paris ou openweathermap.org
+   - Actualités : essaie une autre source d'information
+   - Site inaccessible : essaie un site équivalent ou un moteur de recherche
 
 Historique de la conversation :
 {history}
@@ -26,7 +31,6 @@ Historique de la conversation :
 Tâche : {task}"""
 
 
-# Types d'événement envoyés vers l'UI
 EVT_THINKING = "thinking"
 EVT_ACTION   = "action"
 EVT_OBSERVE  = "observe"
@@ -42,7 +46,6 @@ class SecurityMode:
     FULL_CONTROL  = "FULL_CONTROL"
 
 
-# Outils autorisés par mode
 ALLOWED_TOOLS: Dict[str, set] = {
     SecurityMode.MONITORING: set(),
     SecurityMode.LIMITED_SCOPE: {
