@@ -1,4 +1,5 @@
 import os
+import threading
 from typing import Optional
 from .base_tool import Tool
 
@@ -11,10 +12,11 @@ except ImportError:
 
 class _PlaywrightSession:
     """
-    Session Playwright persistante entre les appels du LLM.
-    Auto-reconnexion si le browser sous-jacent a planté (thread mort).
+    Session Playwright liée au thread courant.
+    Recréée automatiquement si appelée depuis un thread différent.
     """
     _instance: Optional["_PlaywrightSession"] = None
+    _owner_thread: Optional[int] = None
 
     def __init__(self):
         self._playwright = None
@@ -23,23 +25,16 @@ class _PlaywrightSession:
 
     @classmethod
     def get(cls) -> "_PlaywrightSession":
-        if cls._instance is None:
+        current = threading.get_ident()
+        # Recréer si thread différent ou pas d'instance
+        if cls._instance is None or cls._owner_thread != current:
+            if cls._instance is not None:
+                cls._instance._teardown()
             cls._instance = _PlaywrightSession()
+            cls._owner_thread = current
         return cls._instance
 
-    def _is_alive(self) -> bool:
-        """Vérifie si la session Playwright est réellement utilisable."""
-        if self._browser is None or self._page is None:
-            return False
-        try:
-            # Opération légère qui échoue si le thread/process Playwright est mort
-            _ = self._page.url
-            return True
-        except Exception:
-            return False
-
     def _teardown(self):
-        """Libère les ressources sans lever d'exception."""
         try:
             if self._browser:
                 self._browser.close()
@@ -54,17 +49,23 @@ class _PlaywrightSession:
         self._page = None
         self._playwright = None
 
+    def _is_alive(self) -> bool:
+        if self._browser is None or self._page is None:
+            return False
+        try:
+            _ = self._page.url
+            return True
+        except Exception:
+            return False
+
     def start(self) -> bool:
         if not PLAYWRIGHT_AVAILABLE:
             return False
-
-        # Si la session existe mais est morte, on la recrée
+        # Redémarrer si la session est morte (fenêtre fermée manuellement, crash...)
         if self._browser is not None and not self._is_alive():
             self._teardown()
-
         if self._browser is not None:
             return True
-
         try:
             self._playwright = sync_playwright().start()
             self._browser = self._playwright.chromium.launch(headless=False)
@@ -81,6 +82,7 @@ class _PlaywrightSession:
     def close(self):
         self._teardown()
         _PlaywrightSession._instance = None
+        _PlaywrightSession._owner_thread = None
 
 
 # ─── Actions ─────────────────────────────────────────────────────────────────
