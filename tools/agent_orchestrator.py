@@ -25,7 +25,9 @@ Règles ABSOLUES — à respecter sans exception :
    Pour ouvrir un NOUVEL onglet sans fermer la page courante : browser_new_tab.
 7. Pour lire le contenu d'une page (repos, texte, données) : browser_navigate PUIS browser_get_text.
    N'utilise JAMAIS open_url pour récupérer du contenu — open_url ne lit pas la page.
-8. Si un outil retourne [ERREUR], essaie une URL alternative avant de rendre final_answer d'échec.
+8. Si un outil retourne [ERREUR], essaie un outil DIFFÉRENT — ne répète jamais la même commande.
+9. "Ouvrir" une URL, un site, un profil GitHub = toujours browser_navigate ou browser_new_tab.
+   Ne jamais utiliser command_line_execute pour naviguer sur le web.
 
 Historique de la conversation :
 {history}
@@ -194,10 +196,10 @@ class AgentOrchestrator:
                     "content": "[FORMAT ERROR] Réponds UNIQUEMENT avec UN SEUL objet JSON valide, sans texte autour."})
                 continue
 
+            # Correction 1 : on signale le multi-JSON dans l'UI mais on n'injecte
+            # RIEN dans l'historique — l'observation de l'outil suffit comme contexte.
             if had_multiple:
                 self._emit(EVT_WARNING, "[FORMAT] Plusieurs JSON détectés — seule la première action est exécutée.")
-                self.chat_history.append({"role": "tool",
-                    "content": "[RAPPEL] UNE SEULE action par réponse. J'ai exécuté la première, attends l'observation avant d'envoyer la suivante."})
 
             action = parsed.get("action")
 
@@ -218,9 +220,17 @@ class AgentOrchestrator:
                 else:
                     observation = self.dispatcher.dispatch_call(tool_name=tool_name, **params)
 
-                self._emit(EVT_OBSERVE, str(observation)[:500])
-                self.chat_history.append({"role": "tool", "content": str(observation)})
-                # Le cycle continue toujours — le LLM appelle final_answer quand c'est fini.
+                # Correction 3 : enrichir l'observation d'erreur pour forcer un changement d'outil
+                obs_str = str(observation)
+                if obs_str.startswith("[ERREUR]"):
+                    obs_str = (
+                        obs_str +
+                        "\n→ Cet outil a échoué. Utilise un outil DIFFÉRENT ou appelle "
+                        "final_answer pour expliquer l'échec. Ne répète PAS la même commande."
+                    )
+
+                self._emit(EVT_OBSERVE, obs_str[:500])
+                self.chat_history.append({"role": "tool", "content": obs_str})
 
             else:
                 self._emit(EVT_WARNING, f"[ERREUR] Action '{action}' inconnue.")
