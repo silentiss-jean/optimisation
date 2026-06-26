@@ -1,0 +1,64 @@
+{
+  "projet": "Optimisation AI Agent",
+  "mise_a_jour": "2026-06-26",
+  "taches": [
+    {
+      "id": "P1-001",
+      "priorite": 1,
+      "titre": "Supprimer DONE_TRIGGERS ou le rendre configurable",
+      "description": "DONE_TRIGGERS arr\u00eate le cycle agentique d\u00e8s le premier [DONE] d'un outil navigateur. Cela emp\u00eache les t\u00e2ches multi-actions (ouvrir 2 onglets, naviguer puis screenshot). Solution : retirer les outils navigateur de DONE_TRIGGERS et laisser le LLM appeler final_answer lui-m\u00eame, ou ajouter un param\u00e8tre 'multi_step' dans le prompt.",
+      "statut": "todo",
+      "impacte": ["browser_new_tab apr\u00e8s browser_navigate", "browser_screenshot apr\u00e8s browser_navigate", "browser_get_text apr\u00e8s browser_navigate"]
+    },
+    {
+      "id": "P1-002",
+      "priorite": 1,
+      "titre": "Tester avec un mod\u00e8le plus capable (qwen3:14b ou llama3.1:8b)",
+      "description": "qwen3:8b ignore syst\u00e9matiquement la r\u00e8gle 'une action par r\u00e9ponse' m\u00eame avec le prompt renforc\u00e9. Un mod\u00e8le plus grand respecte mieux l'instruction following.",
+      "statut": "todo",
+      "modeles_suggeres": ["qwen3:14b", "llama3.1:8b", "mistral-nemo"]
+    },
+    {
+      "id": "P2-001",
+      "priorite": 2,
+      "titre": "Gestion multi-\u00e9tapes : ne pas arr\u00eater sur DONE pour les outils interm\u00e9diaires",
+      "description": "Distinguer les outils 'terminaux' (open_url = toujours final) des outils 'interm\u00e9diaires' (browser_navigate peut \u00eatre suivi d'un browser_get_text). Ajouter une liste TERMINAL_TOOLS s\u00e9par\u00e9e de DONE_TRIGGERS.",
+      "statut": "todo"
+    },
+    {
+      "id": "P2-002",
+      "priorite": 2,
+      "titre": "Affichage du screenshot dans l'UI",
+      "description": "Apr\u00e8s browser_screenshot, afficher l'image captur\u00e9e directement dans le chat PyQt5 avec QLabel + QPixmap.",
+      "statut": "todo"
+    },
+    {
+      "id": "P2-003",
+      "priorite": 2,
+      "titre": "browser_get_text : test r\u00e9el sur listing de repos GitHub",
+      "description": "Valider que browser_navigate + browser_get_text permet au LLM de lister les repos d'un profil GitHub et de les restituer en final_answer.",
+      "statut": "todo"
+    },
+    {
+      "id": "P3-001",
+      "priorite": 3,
+      "titre": "Gestion des onglets : switcher entre onglets ouverts",
+      "description": "Ajouter browser_switch_tab(index) pour permettre au LLM de revenir sur un onglet pr\u00e9c\u00e9dent. Exposer la liste des onglets ouverts dans l'observation.",
+      "statut": "todo"
+    },
+    {
+      "id": "P3-002",
+      "priorite": 3,
+      "titre": "M\u00e9moire persistante entre conversations",
+      "description": "Sauvegarder chat_history dans un fichier JSON entre les sessions pour donner de la continuit\u00e9 \u00e0 l'agent.",
+      "statut": "todo"
+    },
+    {
+      "id": "P3-003",
+      "priorite": 3,
+      "titre": "Indicateur de progression dans l'UI",
+      "description": "Afficher une barre de progression ou un spinner pendant que l'agent tourne. Actuellement le bouton reste actif et l'utilisateur ne sait pas si l'agent travaille.",
+      "statut": "todo"
+    }
+  ]
+}
