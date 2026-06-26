@@ -17,16 +17,13 @@ class ToolDispatcher:
     def __init__(self):
         self._tools: Dict[str, Tool] = {}
 
-        # Outils filesystem (3 outils groupés)
         for tool in FileSystemTool().tools:
             self._register(tool)
 
-        # Outils individuels
         self._register(CommandLineTool())
         self._register(OpenUrlTool())
         self._register(WebScraperTool())
 
-        # Playwright (5 actions groupées)
         for tool in PlaywrightBrowserTool().tools:
             self._register(tool)
 
@@ -34,12 +31,16 @@ class ToolDispatcher:
         self._tools[tool.name] = tool
 
     def get_tools_description(self) -> str:
-        """Génère automatiquement la description des outils depuis leurs métadonnées."""
         sections = {
             "Fichiers":    ["read_file", "write_file", "find_files"],
             "Système":    ["command_line_execute"],
-            "Navigateur": ["open_url", "browser_navigate", "browser_click",
-                           "browser_fill", "browser_screenshot", "browser_get_text"],
+            "Navigateur": [
+                "open_url",
+                "browser_navigate", "browser_new_tab",
+                "browser_click", "browser_fill",
+                "browser_get_text", "browser_scroll", "browser_wait_for",
+                "browser_screenshot",
+            ],
             "Web":        ["web_scrape"],
         }
         lines = ["Outils disponibles :\n"]

@@ -18,12 +18,10 @@ Règles strictes :
 3. Si tu as la réponse finale, réponds IMMEDÉATEMENT avec :
    {{"action": "final_answer", "answer": "<ta réponse complète>"}}
 4. En mode MONITORING, tu ne peux PAS utiliser d'outils. Donne directement une final_answer.
-5. Pour les actions navigateur, commence toujours par browser_navigate avant browser_click/fill/get_text.
-6. Si un outil retourne [ERREUR] ou Timeout sur une URL, essaie OBLIGATOIREMENT une URL alternative 
-   avant de rendre une final_answer d'échec. Exemples d'alternatives :
-   - Météo Paris : essaie wttr.in/Paris ou openweathermap.org
-   - Actualités : essaie une autre source d'information
-   - Site inaccessible : essaie un site équivalent ou un moteur de recherche
+5. Pour les actions navigateur, utilise browser_navigate pour l'onglet actif,
+   browser_new_tab pour ouvrir SANS fermer la page courante.
+6. Si un outil retourne [ERREUR] ou Timeout sur une URL, essaie OBLIGATOIREMENT une URL alternative
+   avant de rendre une final_answer d'échec.
 
 Historique de la conversation :
 {history}
@@ -54,23 +52,20 @@ ALLOWED_TOOLS: Dict[str, set] = {
     SecurityMode.FULL_CONTROL: {
         "read_file", "write_file", "find_files",
         "command_line_execute", "open_url", "web_scrape",
-        "browser_navigate", "browser_click", "browser_fill",
+        "browser_navigate", "browser_new_tab",
+        "browser_click", "browser_fill",
         "browser_screenshot", "browser_get_text",
+        "browser_scroll", "browser_wait_for",
     },
 }
 
-# Outils dont [DONE] dans l'observation signifie tâche accomplie → sortie immédiate
 DONE_TRIGGERS: set = {
-    "browser_navigate", "browser_click", "browser_fill",
-    "browser_screenshot", "open_url",
+    "browser_navigate", "browser_new_tab", "browser_click",
+    "browser_fill", "browser_screenshot", "open_url",
 }
 
 
 class AgentOrchestrator:
-    """
-    Orchestrateur ReAct : Pensée → Action → Observation, jusqu'à réponse finale.
-    Supporte un callback on_event(event_type, data) pour le streaming temps réel.
-    """
     def __init__(self, llm_provider: LLMProvider, dispatcher: ToolDispatcher,
                  on_event: Optional[Callable[[str, str], None]] = None):
         self.llm_provider = llm_provider
@@ -94,7 +89,6 @@ class AgentOrchestrator:
 
     def _check_security(self, tool_name: str, params: Dict[str, Any]) -> tuple[bool, str]:
         allowed_set = ALLOWED_TOOLS.get(self.security_mode, set())
-
         if tool_name not in allowed_set:
             if self.security_mode == SecurityMode.MONITORING:
                 return False, "🛑 Action bloquée : mode MONITORING actif."
@@ -102,14 +96,10 @@ class AgentOrchestrator:
                 f"🛑 Outil '{tool_name}' non autorisé en mode {self.security_mode}. "
                 f"Outils disponibles : {', '.join(sorted(allowed_set)) or 'aucun'}."
             )
-
         if self.security_mode == SecurityMode.LIMITED_SCOPE and self.current_scope:
             path = params.get('file_path') or params.get('directory', '')
             if path and not str(path).startswith(self.current_scope):
-                return False, (
-                    f"🛑 Chemin '{path}' hors du scope autorisé '{self.current_scope}'."
-                )
-
+                return False, f"🛑 Chemin '{path}' hors du scope autorisé '{self.current_scope}'."
         return True, ""
 
     def _build_system_prompt(self, task: str) -> str:
@@ -141,29 +131,25 @@ class AgentOrchestrator:
         except json.JSONDecodeError:
             return None
 
-    def _make_done_answer(self, tool_name: str, params: Dict[str, Any],
-                          observation: str) -> str:
-        """Construit une final_answer lisible quand [DONE] est détecté côté Python."""
-        if tool_name == "browser_navigate":
-            url = observation.split("Navigé vers :")[-1].strip()
-            return f"Le navigateur a été ouvert sur : {url}"
+    def _make_done_answer(self, tool_name: str, params: Dict[str, Any], observation: str) -> str:
+        if tool_name in ("browser_navigate", "browser_new_tab"):
+            url = observation.split(":", 2)[-1].strip()
+            label = "Nouvel onglet ouvert" if tool_name == "browser_new_tab" else "Navigateur ouvert"
+            return f"{label} sur : {url}"
         if tool_name == "browser_click":
             return f"Clic effectué sur '{params.get('selector', '')}'."
         if tool_name == "browser_fill":
             return f"Champ '{params.get('selector', '')}' rempli."
         if tool_name == "browser_screenshot":
-            path = params.get('save_path', 'screenshot.png')
-            return f"Capture d'écran sauvegardée : {path}"
+            return f"Capture d'écran sauvegardée : {params.get('save_path', 'screenshot.png')}"
         if tool_name == "open_url":
             return f"URL ouverte : {params.get('url', '')}"
         return observation.replace("[DONE]", "").strip()
 
     def run_agentic_cycle(self, initial_prompt: str, max_steps: int = 8) -> Optional[str]:
         task = initial_prompt
-
         for step in range(max_steps):
             self._emit(EVT_STEP, f"Étape {step + 1}/{max_steps}")
-
             system_prompt = self._build_system_prompt(task)
 
             self._emit(EVT_THINKING, "")
@@ -176,7 +162,6 @@ class AgentOrchestrator:
             self.chat_history.append({"role": "assistant", "content": raw_response})
 
             parsed = self._parse_llm_response(raw_response)
-
             if not parsed:
                 self._emit(EVT_WARNING, "[FORMAT] Réponse non-JSON, nouvelle tentative...")
                 self.chat_history.append({"role": "tool",
@@ -205,7 +190,6 @@ class AgentOrchestrator:
                 self._emit(EVT_OBSERVE, str(observation)[:500])
                 self.chat_history.append({"role": "tool", "content": str(observation)})
 
-                # Sortie immédiate côté Python — ne repasse pas par le LLM
                 if "[DONE]" in str(observation) and tool_name in DONE_TRIGGERS:
                     answer = self._make_done_answer(tool_name, params, str(observation))
                     self._emit(EVT_ANSWER, answer)

@@ -4,7 +4,7 @@ from typing import Optional
 from .base_tool import Tool
 
 try:
-    from playwright.sync_api import sync_playwright, Browser, Page
+    from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -13,44 +13,39 @@ except ImportError:
 class _PlaywrightSession:
     """
     Session Playwright liée au thread courant.
-    Recréée automatiquement si appelée depuis un thread différent.
+    Une seule fenêtre (BrowserContext) est partagée — les onglets s'y ajoutent.
+    Recréée automatiquement si thread différent ou fenêtre fermée.
     """
     _instance: Optional["_PlaywrightSession"] = None
     _owner_thread: Optional[int] = None
 
     def __init__(self):
-        self._playwright = None
-        self._browser: Optional[Browser] = None
-        self._page: Optional[Page] = None
+        self._playwright  = None
+        self._browser: Optional[Browser]        = None
+        self._context: Optional[BrowserContext] = None
+        self._page: Optional[Page]              = None   # onglet actif
 
     @classmethod
     def get(cls) -> "_PlaywrightSession":
         current = threading.get_ident()
-        # Recréer si thread différent ou pas d'instance
         if cls._instance is None or cls._owner_thread != current:
             if cls._instance is not None:
                 cls._instance._teardown()
-            cls._instance = _PlaywrightSession()
+            cls._instance    = _PlaywrightSession()
             cls._owner_thread = current
         return cls._instance
 
+    # ------------------------------------------------------------------
     def _teardown(self):
-        try:
-            if self._browser:
-                self._browser.close()
-        except Exception:
-            pass
-        try:
-            if self._playwright:
-                self._playwright.stop()
-        except Exception:
-            pass
-        self._browser = None
-        self._page = None
-        self._playwright = None
+        for obj in (self._context, self._browser, self._playwright):
+            try:
+                if obj: obj.close() if hasattr(obj, 'close') else obj.stop()
+            except Exception:
+                pass
+        self._page = self._context = self._browser = self._playwright = None
 
     def _is_alive(self) -> bool:
-        if self._browser is None or self._page is None:
+        if not self._page:
             return False
         try:
             _ = self._page.url
@@ -61,27 +56,40 @@ class _PlaywrightSession:
     def start(self) -> bool:
         if not PLAYWRIGHT_AVAILABLE:
             return False
-        # Redémarrer si la session est morte (fenêtre fermée manuellement, crash...)
         if self._browser is not None and not self._is_alive():
             self._teardown()
         if self._browser is not None:
             return True
         try:
             self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(headless=False)
-            self._page = self._browser.new_page()
+            self._browser    = self._playwright.chromium.launch(headless=False)
+            self._context    = self._browser.new_context()
+            self._page       = self._context.new_page()
             return True
         except Exception:
             self._teardown()
             return False
 
+    # ------------------------------------------------------------------
     @property
     def page(self) -> Optional[Page]:
         return self._page
 
+    def new_tab(self, url: str) -> str:
+        """Ouvre un nouvel onglet dans la MEME fenêtre et l'active."""
+        if not self._context:
+            return "[ERREUR] Aucun contexte navigateur actif."
+        try:
+            tab = self._context.new_page()
+            tab.goto(url, wait_until="domcontentloaded", timeout=8000)
+            self._page = tab   # l'onglet devient l'onglet actif
+            return f"[DONE] Nouvel onglet ouvert : {tab.url}"
+        except Exception as e:
+            return f"[ERREUR browser_new_tab] {str(e).split(chr(10))[0]}"
+
     def close(self):
         self._teardown()
-        _PlaywrightSession._instance = None
+        _PlaywrightSession._instance    = None
         _PlaywrightSession._owner_thread = None
 
 
@@ -91,32 +99,38 @@ class BrowserNavigateTool(Tool):
     def __init__(self):
         super().__init__(
             name="browser_navigate",
-            description="Naviguer vers une URL dans le navigateur contrôlé (Playwright). Lance ou restaure le navigateur si besoin.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "URL cible (https://...)"}
-                },
-                "required": ["url"]
-            }
+            description="Naviguer vers une URL dans l'onglet actif du navigateur.",
+            parameters={"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}
         )
-
     def execute(self, url: str, **kwargs) -> str:
-        if not url.startswith(("http://", "https://")):
+        if not url.startswith(("http://","https://")):
             url = "https://" + url
-
         session = _PlaywrightSession.get()
         if not session.start():
-            import webbrowser
-            webbrowser.open(url)
+            import webbrowser; webbrowser.open(url)
             return f"[FALLBACK] Playwright indisponible. Ouvert via webbrowser : {url}"
-
         try:
             session.page.goto(url, wait_until="domcontentloaded", timeout=8000)
             return f"[DONE] Navigé vers : {session.page.url}"
         except Exception as e:
-            err = str(e).split("\n")[0]
-            return f"[ERREUR browser_navigate] {err}. Essaie une URL alternative."
+            return f"[ERREUR browser_navigate] {str(e).split(chr(10))[0]}. Essaie une URL alternative."
+
+
+class BrowserNewTabTool(Tool):
+    def __init__(self):
+        super().__init__(
+            name="browser_new_tab",
+            description="Ouvrir une URL dans un NOUVEL ONGLET de la fenêtre existante (sans ouvrir une nouvelle fenêtre).",
+            parameters={"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}
+        )
+    def execute(self, url: str, **kwargs) -> str:
+        if not url.startswith(("http://","https://")):
+            url = "https://" + url
+        session = _PlaywrightSession.get()
+        if not session.start():
+            import webbrowser; webbrowser.open(url)
+            return f"[FALLBACK] Playwright indisponible. Ouvert via webbrowser : {url}"
+        return session.new_tab(url)
 
 
 class BrowserClickTool(Tool):
@@ -124,19 +138,12 @@ class BrowserClickTool(Tool):
         super().__init__(
             name="browser_click",
             description="Cliquer sur un élément de la page via un sélecteur CSS.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "selector": {"type": "string", "description": "Sélecteur CSS (ex: \"button#submit\", \"a.nav-link\")"}
-                },
-                "required": ["selector"]
-            }
+            parameters={"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]}
         )
-
     def execute(self, selector: str, **kwargs) -> str:
         session = _PlaywrightSession.get()
-        if not session.start() or session.page is None:
-            return "[ERREUR] Aucune session navigateur active. Utilise browser_navigate d'abord."
+        if not session.start() or not session.page:
+            return "[ERREUR] Aucune session active. Utilise browser_navigate d'abord."
         try:
             session.page.click(selector, timeout=8000)
             return f"[DONE] Cliqué sur '{selector}'."
@@ -149,20 +156,12 @@ class BrowserFillTool(Tool):
         super().__init__(
             name="browser_fill",
             description="Remplir un champ de saisie avec du texte via un sélecteur CSS.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "selector": {"type": "string", "description": "Sélecteur CSS du champ input."},
-                    "text":     {"type": "string", "description": "Texte à saisir."}
-                },
-                "required": ["selector", "text"]
-            }
+            parameters={"type":"object","properties":{"selector":{"type":"string"},"text":{"type":"string"}},"required":["selector","text"]}
         )
-
     def execute(self, selector: str, text: str, **kwargs) -> str:
         session = _PlaywrightSession.get()
-        if not session.start() or session.page is None:
-            return "[ERREUR] Aucune session navigateur active. Utilise browser_navigate d'abord."
+        if not session.start() or not session.page:
+            return "[ERREUR] Aucune session active. Utilise browser_navigate d'abord."
         try:
             session.page.fill(selector, text, timeout=8000)
             return f"[DONE] Champ '{selector}' rempli."
@@ -174,23 +173,13 @@ class BrowserScreenshotTool(Tool):
     def __init__(self):
         super().__init__(
             name="browser_screenshot",
-            description="Capturer une capture d'écran de la page courante et la sauvegarder.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "save_path": {
-                        "type": "string",
-                        "description": "Chemin de sauvegarde (ex: \"screenshot.png\"). Défaut: screenshot.png"
-                    }
-                },
-                "required": []
-            }
+            description="Capturer une capture d'écran de la page courante.",
+            parameters={"type":"object","properties":{"save_path":{"type":"string","description":"Chemin de sauvegarde. Défaut: screenshot.png"}},"required":[]}
         )
-
     def execute(self, save_path: str = "screenshot.png", **kwargs) -> str:
         session = _PlaywrightSession.get()
-        if not session.start() or session.page is None:
-            return "[ERREUR] Aucune session navigateur active. Utilise browser_navigate d'abord."
+        if not session.start() or not session.page:
+            return "[ERREUR] Aucune session active. Utilise browser_navigate d'abord."
         try:
             abs_path = os.path.abspath(save_path)
             session.page.screenshot(path=abs_path, full_page=True)
@@ -203,40 +192,81 @@ class BrowserGetTextTool(Tool):
     def __init__(self):
         super().__init__(
             name="browser_get_text",
-            description="Récupérer le texte visible de la page courante ou d'un élément spécifique.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "selector": {
-                        "type": "string",
-                        "description": "Sélecteur CSS optionnel. Si vide, retourne le texte complet de la page."
-                    }
-                },
-                "required": []
-            }
+            description="Récupérer le texte visible de la page courante ou d'un élément CSS.",
+            parameters={"type":"object","properties":{"selector":{"type":"string","description":"Sélecteur CSS optionnel. Vide = toute la page."}},"required":[]}
         )
-
     def execute(self, selector: str = "", **kwargs) -> str:
         session = _PlaywrightSession.get()
-        if not session.start() or session.page is None:
-            return "[ERREUR] Aucune session navigateur active. Utilise browser_navigate d'abord."
+        if not session.start() or not session.page:
+            return "[ERREUR] Aucune session active. Utilise browser_navigate d'abord."
         try:
-            if selector:
-                text = session.page.locator(selector).first.inner_text(timeout=8000)
-            else:
-                text = session.page.locator("body").inner_text()
-            return text[:3000]
+            target = session.page.locator(selector).first if selector else session.page.locator("body")
+            return target.inner_text(timeout=8000)[:3000]
         except Exception as e:
             return f"[ERREUR browser_get_text] {str(e).split(chr(10))[0]}"
 
 
+class BrowserScrollTool(Tool):
+    def __init__(self):
+        super().__init__(
+            name="browser_scroll",
+            description="Scroller la page vers le bas ou le haut pour charger du contenu lazy.",
+            parameters={
+                "type":"object",
+                "properties":{
+                    "direction":{"type":"string","description":"'down' ou 'up'. Défaut: down."},
+                    "amount":{"type":"number","description":"Pixels à scroller. Défaut: 600."}
+                },
+                "required":[]
+            }
+        )
+    def execute(self, direction: str = "down", amount: int = 600, **kwargs) -> str:
+        session = _PlaywrightSession.get()
+        if not session.start() or not session.page:
+            return "[ERREUR] Aucune session active. Utilise browser_navigate d'abord."
+        try:
+            delta = amount if direction == "down" else -amount
+            session.page.evaluate(f"window.scrollBy(0, {delta})")
+            return f"[DONE] Scrollé {direction} de {abs(delta)}px."
+        except Exception as e:
+            return f"[ERREUR browser_scroll] {str(e).split(chr(10))[0]}"
+
+
+class BrowserWaitForTool(Tool):
+    def __init__(self):
+        super().__init__(
+            name="browser_wait_for",
+            description="Attendre qu'un sélecteur CSS soit visible avant de continuer (utile après un clic ou navigation lente).",
+            parameters={
+                "type":"object",
+                "properties":{
+                    "selector":{"type":"string","description":"Sélecteur CSS à attendre."},
+                    "timeout":{"type":"number","description":"Timeout en ms. Défaut: 5000."}
+                },
+                "required":["selector"]
+            }
+        )
+    def execute(self, selector: str, timeout: int = 5000, **kwargs) -> str:
+        session = _PlaywrightSession.get()
+        if not session.start() or not session.page:
+            return "[ERREUR] Aucune session active. Utilise browser_navigate d'abord."
+        try:
+            session.page.wait_for_selector(selector, timeout=timeout)
+            return f"[DONE] Élément '{selector}' visible."
+        except Exception as e:
+            return f"[ERREUR browser_wait_for] {str(e).split(chr(10))[0]}"
+
+
 class PlaywrightBrowserTool:
-    """Groupe les 5 actions Playwright pour l'enregistrement dans ToolDispatcher."""
+    """Groupe les 8 actions Playwright pour ToolDispatcher."""
     def __init__(self):
         self.tools = [
             BrowserNavigateTool(),
+            BrowserNewTabTool(),
             BrowserClickTool(),
             BrowserFillTool(),
             BrowserScreenshotTool(),
             BrowserGetTextTool(),
+            BrowserScrollTool(),
+            BrowserWaitForTool(),
         ]
