@@ -14,12 +14,12 @@ Mode de sécurité actif : {security_mode}{scope_info}
 
 Règles ABSOLUES — à respecter sans exception :
 1. Réponds UNIQUEMENT avec UN SEUL objet JSON valide, sans texte autour.
-2. UNE SEULE action par réponse. Si la tâche demande 2 actions, fais la première,
-   attends l'observation, puis fais la seconde dans la réponse suivante.
+2. UNE SEULE action par réponse. Si la tâche demande plusieurs actions, fais la première,
+   attends l'observation, puis fais la suivante.
 3. Pour utiliser un outil :
    {{"action": "tool", "tool": "<nom_outil>", "params": {{...}}}}
-4. Pour donner la réponse finale :
-   {{"action": "final_answer", "answer": "<ta réponse complète>"}}
+4. Quand TOUTES les actions demandées sont terminées, appelle final_answer :
+   {{"action": "final_answer", "answer": "<résumé de ce qui a été fait>"}}
 5. En mode MONITORING, pas d'outils — final_answer directement.
 6. Pour ouvrir une URL dans l'onglet actif : browser_navigate.
    Pour ouvrir un NOUVEL onglet sans fermer la page courante : browser_new_tab.
@@ -63,7 +63,9 @@ ALLOWED_TOOLS: Dict[str, set] = {
     },
 }
 
-DONE_TRIGGERS: set = {
+# Outils dont l'observation doit être affichée mais qui ne stoppent PAS le cycle.
+# Le LLM décide lui-même quand appeler final_answer.
+INFO_TOOLS: set = {
     "browser_navigate", "browser_new_tab", "browser_click",
     "browser_fill", "browser_screenshot", "open_url",
 }
@@ -130,13 +132,11 @@ class AgentOrchestrator:
         Retourne (parsed, had_multiple) où had_multiple=True si plusieurs JSON détectés.
         """
         raw = raw.strip()
-        # Trouver tous les blocs JSON candidats
         candidates = [m.start() for m in re.finditer(r'\{', raw)]
         had_multiple = False
         first_parsed = None
 
         for start in candidates:
-            # Trouver la fin de ce bloc JSON
             depth, i = 0, start
             in_string = False
             escape_next = False
@@ -161,7 +161,7 @@ class AgentOrchestrator:
                                     first_parsed = parsed
                                 else:
                                     had_multiple = True
-                                    break  # pas besoin de chercher plus
+                                    break
                             except json.JSONDecodeError:
                                 pass
                             break
@@ -170,21 +170,6 @@ class AgentOrchestrator:
                 break
 
         return first_parsed, had_multiple
-
-    def _make_done_answer(self, tool_name: str, params: Dict[str, Any], observation: str) -> str:
-        if tool_name in ("browser_navigate", "browser_new_tab"):
-            url = observation.split(":", 2)[-1].strip()
-            label = "Nouvel onglet ouvert" if tool_name == "browser_new_tab" else "Navigateur ouvert"
-            return f"{label} sur : {url}"
-        if tool_name == "browser_click":
-            return f"Clic effectué sur '{params.get('selector', '')}'."
-        if tool_name == "browser_fill":
-            return f"Champ '{params.get('selector', '')}' rempli."
-        if tool_name == "browser_screenshot":
-            return f"Capture d'écran sauvegardée : {params.get('save_path', 'screenshot.png')}"
-        if tool_name == "open_url":
-            return f"URL ouverte : {params.get('url', '')}"
-        return observation.replace("[DONE]", "").strip()
 
     def run_agentic_cycle(self, initial_prompt: str, max_steps: int = 8) -> Optional[str]:
         task = initial_prompt
@@ -210,7 +195,6 @@ class AgentOrchestrator:
                 continue
 
             if had_multiple:
-                # On exécute le premier JSON et on prévient le LLM
                 self._emit(EVT_WARNING, "[FORMAT] Plusieurs JSON détectés — seule la première action est exécutée.")
                 self.chat_history.append({"role": "tool",
                     "content": "[RAPPEL] UNE SEULE action par réponse. J'ai exécuté la première, attends l'observation avant d'envoyer la suivante."})
@@ -236,11 +220,7 @@ class AgentOrchestrator:
 
                 self._emit(EVT_OBSERVE, str(observation)[:500])
                 self.chat_history.append({"role": "tool", "content": str(observation)})
-
-                if "[DONE]" in str(observation) and tool_name in DONE_TRIGGERS:
-                    answer = self._make_done_answer(tool_name, params, str(observation))
-                    self._emit(EVT_ANSWER, answer)
-                    return answer
+                # Le cycle continue toujours — le LLM appelle final_answer quand c'est fini.
 
             else:
                 self._emit(EVT_WARNING, f"[ERREUR] Action '{action}' inconnue.")
