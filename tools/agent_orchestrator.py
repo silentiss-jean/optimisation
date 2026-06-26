@@ -15,9 +15,10 @@ Règles strictes :
 1. Réponds UNIQUEMENT en JSON valide, sans texte autour.
 2. Si tu dois utiliser un outil, réponds avec :
    {{"action": "tool", "tool": "<nom_outil>", "params": {{...}}}}
-3. Si tu as la réponse finale OU si l'observation indique [DONE], réponds IMMÉDIATEMENT avec :
+3. Si tu as la réponse finale OU si l'observation indique [DONE], réponds IMMEDÉATEMENT avec :
    {{"action": "final_answer", "answer": "<ta réponse complète>"}}
 4. En mode MONITORING, tu ne peux PAS utiliser d'outils. Donne directement une final_answer.
+5. Pour les actions navigateur, commence toujours par browser_navigate avant browser_click/fill/get_text.
 
 Historique de la conversation :
 {history}
@@ -49,7 +50,9 @@ ALLOWED_TOOLS: Dict[str, set] = {
     },
     SecurityMode.FULL_CONTROL: {
         "read_file", "write_file", "find_files",
-        "command_line_execute", "open_url", "web_scrape"
+        "command_line_execute", "open_url", "web_scrape",
+        "browser_navigate", "browser_click", "browser_fill",
+        "browser_screenshot", "browser_get_text",
     },
 }
 

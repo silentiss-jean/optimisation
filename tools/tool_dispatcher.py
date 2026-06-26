@@ -4,6 +4,7 @@ from tools.filesystem_tool import FileSystemTool
 from tools.command_line_tool import CommandLineTool
 from tools.open_url_tool import OpenUrlTool
 from tools.web_scraper_tool import WebScraperTool
+from tools.playwright_browser_tool import PlaywrightBrowserTool
 
 
 class ToolDispatcher:
@@ -25,6 +26,10 @@ class ToolDispatcher:
         self._register(OpenUrlTool())
         self._register(WebScraperTool())
 
+        # Playwright (5 actions groupées)
+        for tool in PlaywrightBrowserTool().tools:
+            self._register(tool)
+
     def _register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 
@@ -33,7 +38,8 @@ class ToolDispatcher:
         sections = {
             "Fichiers":    ["read_file", "write_file", "find_files"],
             "Système":    ["command_line_execute"],
-            "Navigateur": ["open_url"],
+            "Navigateur": ["open_url", "browser_navigate", "browser_click",
+                           "browser_fill", "browser_screenshot", "browser_get_text"],
             "Web":        ["web_scrape"],
         }
         lines = ["Outils disponibles :\n"]
@@ -42,7 +48,6 @@ class ToolDispatcher:
             for name in names:
                 tool = self._tools.get(name)
                 if tool:
-                    # Extraire les paramètres requis pour l'affichage
                     props = tool.parameters.get("properties", {})
                     params_str = ", ".join(
                         f"{k}: {v.get('type', 'str')}" for k, v in props.items()
