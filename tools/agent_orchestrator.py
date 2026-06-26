@@ -28,6 +28,8 @@ Règles ABSOLUES — à respecter sans exception :
 8. Si un outil retourne [ERREUR], essaie un outil DIFFÉRENT — ne répète jamais la même commande.
 9. "Ouvrir" une URL, un site, un profil GitHub = toujours browser_navigate ou browser_new_tab.
    Ne jamais utiliser command_line_execute pour naviguer sur le web.
+10. Pour lister les repos GitHub d'un utilisateur : utilise web_scrape avec
+    https://api.github.com/users/{{username}}/repos — c'est plus fiable que de scraper le DOM.
 
 Historique de la conversation :
 {history}
@@ -66,7 +68,6 @@ ALLOWED_TOOLS: Dict[str, set] = {
 }
 
 # Outils dont l'observation doit être affichée mais qui ne stoppent PAS le cycle.
-# Le LLM décide lui-même quand appeler final_answer.
 INFO_TOOLS: set = {
     "browser_navigate", "browser_new_tab", "browser_click",
     "browser_fill", "browser_screenshot", "open_url",
@@ -196,8 +197,6 @@ class AgentOrchestrator:
                     "content": "[FORMAT ERROR] Réponds UNIQUEMENT avec UN SEUL objet JSON valide, sans texte autour."})
                 continue
 
-            # Correction 1 : on signale le multi-JSON dans l'UI mais on n'injecte
-            # RIEN dans l'historique — l'observation de l'outil suffit comme contexte.
             if had_multiple:
                 self._emit(EVT_WARNING, "[FORMAT] Plusieurs JSON détectés — seule la première action est exécutée.")
 
@@ -220,8 +219,17 @@ class AgentOrchestrator:
                 else:
                     observation = self.dispatcher.dispatch_call(tool_name=tool_name, **params)
 
-                # Correction 3 : enrichir l'observation d'erreur pour forcer un changement d'outil
                 obs_str = str(observation)
+
+                # Bug E : après un [DONE], inviter à appeler final_answer si c'était la dernière action
+                if obs_str.startswith("[DONE]"):
+                    obs_str = (
+                        obs_str +
+                        "\n→ Action réussie. Si toutes les tâches demandées sont terminées, "
+                        "appelle final_answer maintenant."
+                    )
+
+                # Bug D / correction 3 : enrichir l'observation d'erreur
                 if obs_str.startswith("[ERREUR]"):
                     obs_str = (
                         obs_str +
