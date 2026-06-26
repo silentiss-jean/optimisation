@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Dict, Any, Optional, Callable
 
 from providers.llm_provider_interface import LLMProvider
@@ -11,17 +12,20 @@ SYSTEM_PROMPT_TEMPLATE = """Tu es un agent IA autonome. Tu dois accomplir la tâ
 
 Mode de sécurité actif : {security_mode}{scope_info}
 
-Règles strictes :
-1. Réponds UNIQUEMENT en JSON valide, sans texte autour.
-2. Si tu dois utiliser un outil, réponds avec :
+Règles ABSOLUES — à respecter sans exception :
+1. Réponds UNIQUEMENT avec UN SEUL objet JSON valide, sans texte autour.
+2. UNE SEULE action par réponse. Si la tâche demande 2 actions, fais la première,
+   attends l'observation, puis fais la seconde dans la réponse suivante.
+3. Pour utiliser un outil :
    {{"action": "tool", "tool": "<nom_outil>", "params": {{...}}}}
-3. Si tu as la réponse finale, réponds IMMEDÉATEMENT avec :
+4. Pour donner la réponse finale :
    {{"action": "final_answer", "answer": "<ta réponse complète>"}}
-4. En mode MONITORING, tu ne peux PAS utiliser d'outils. Donne directement une final_answer.
-5. Pour les actions navigateur, utilise browser_navigate pour l'onglet actif,
-   browser_new_tab pour ouvrir SANS fermer la page courante.
-6. Si un outil retourne [ERREUR] ou Timeout sur une URL, essaie OBLIGATOIREMENT une URL alternative
-   avant de rendre une final_answer d'échec.
+5. En mode MONITORING, pas d'outils — final_answer directement.
+6. Pour ouvrir une URL dans l'onglet actif : browser_navigate.
+   Pour ouvrir un NOUVEL onglet sans fermer la page courante : browser_new_tab.
+7. Pour lire le contenu d'une page (repos, texte, données) : browser_navigate PUIS browser_get_text.
+   N'utilise JAMAIS open_url pour récupérer du contenu — open_url ne lit pas la page.
+8. Si un outil retourne [ERREUR], essaie une URL alternative avant de rendre final_answer d'échec.
 
 Historique de la conversation :
 {history}
@@ -120,16 +124,52 @@ class AgentOrchestrator:
             task=task
         )
 
-    def _parse_llm_response(self, raw: str) -> Optional[Dict]:
-        raw   = raw.strip()
-        start = raw.find('{')
-        end   = raw.rfind('}') + 1
-        if start == -1 or end == 0:
-            return None
-        try:
-            return json.loads(raw[start:end])
-        except json.JSONDecodeError:
-            return None
+    def _parse_llm_response(self, raw: str) -> tuple[Optional[Dict], bool]:
+        """
+        Extrait le PREMIER objet JSON valide de la réponse.
+        Retourne (parsed, had_multiple) où had_multiple=True si plusieurs JSON détectés.
+        """
+        raw = raw.strip()
+        # Trouver tous les blocs JSON candidats
+        candidates = [m.start() for m in re.finditer(r'\{', raw)]
+        had_multiple = False
+        first_parsed = None
+
+        for start in candidates:
+            # Trouver la fin de ce bloc JSON
+            depth, i = 0, start
+            in_string = False
+            escape_next = False
+            while i < len(raw):
+                c = raw[i]
+                if escape_next:
+                    escape_next = False
+                elif c == '\\' and in_string:
+                    escape_next = True
+                elif c == '"':
+                    in_string = not in_string
+                elif not in_string:
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            candidate_str = raw[start:i + 1]
+                            try:
+                                parsed = json.loads(candidate_str)
+                                if first_parsed is None:
+                                    first_parsed = parsed
+                                else:
+                                    had_multiple = True
+                                    break  # pas besoin de chercher plus
+                            except json.JSONDecodeError:
+                                pass
+                            break
+                i += 1
+            if had_multiple:
+                break
+
+        return first_parsed, had_multiple
 
     def _make_done_answer(self, tool_name: str, params: Dict[str, Any], observation: str) -> str:
         if tool_name in ("browser_navigate", "browser_new_tab"):
@@ -161,12 +201,19 @@ class AgentOrchestrator:
             raw_response = "".join(raw_chunks).strip()
             self.chat_history.append({"role": "assistant", "content": raw_response})
 
-            parsed = self._parse_llm_response(raw_response)
+            parsed, had_multiple = self._parse_llm_response(raw_response)
+
             if not parsed:
                 self._emit(EVT_WARNING, "[FORMAT] Réponse non-JSON, nouvelle tentative...")
                 self.chat_history.append({"role": "tool",
-                    "content": "[FORMAT ERROR] Réponds UNIQUEMENT en JSON valide."})
+                    "content": "[FORMAT ERROR] Réponds UNIQUEMENT avec UN SEUL objet JSON valide, sans texte autour."})
                 continue
+
+            if had_multiple:
+                # On exécute le premier JSON et on prévient le LLM
+                self._emit(EVT_WARNING, "[FORMAT] Plusieurs JSON détectés — seule la première action est exécutée.")
+                self.chat_history.append({"role": "tool",
+                    "content": "[RAPPEL] UNE SEULE action par réponse. J'ai exécuté la première, attends l'observation avant d'envoyer la suivante."})
 
             action = parsed.get("action")
 
