@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import re
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
@@ -9,7 +10,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QTextEdit, QLineEdit, QLabel, QMessageBox,
     QComboBox, QGroupBox, QFormLayout, QRadioButton, QButtonGroup,
     QFileDialog, QDialog, QDialogButtonBox, QStackedWidget,
-    QListWidget, QListWidgetItem, QSplitter
+    QListWidget, QListWidgetItem, QSplitter, QProgressBar
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat, QPixmap, QTextImageFormat
@@ -359,7 +360,6 @@ class MainWindow(QMainWindow):
             self._append_colored("\n🗑️  Mémoire effacée.\n", "#888888")
 
     def _add_long_term_fact(self):
-        """Ajoute le texte du champ dans la mémoire longue durée."""
         fact = self.lt_input.text().strip()
         if not fact:
             return
@@ -369,7 +369,6 @@ class MainWindow(QMainWindow):
         self._append_colored(f"\n🧠 Fait mémorisé : {fact}\n", "#b39ddb")
 
     def _remove_long_term_fact(self):
-        """Supprime le fait sélectionné dans la liste."""
         item = self.lt_list.currentItem()
         if not item:
             return
@@ -379,10 +378,17 @@ class MainWindow(QMainWindow):
         self._append_colored(f"\n🗑️  Fait supprimé : {fact}\n", "#888888")
 
     def _refresh_lt_list(self):
-        """Recharge la liste UI depuis le store."""
         self.lt_list.clear()
         for fact in self.memory_store.long_term:
             self.lt_list.addItem(QListWidgetItem(fact))
+
+    # ─────────────────────────────────────────────────────── progress helper
+    def _set_progress(self, current: int, total: int, text: str = ""):
+        total   = max(total, 1)
+        current = max(0, min(current, total))
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(current)
+        self.progress_label.setText(text or f"Étape {current}/{total}")
 
     # ─────────────────────────────────────────────────────── setup UI
     def _setup_ui(self):
@@ -480,13 +486,9 @@ class MainWindow(QMainWindow):
         mem_group  = QGroupBox("🧠 Mémoire longue durée")
         mem_layout = QVBoxLayout()
         mem_layout.setSpacing(4)
-
-        # Chemin du fichier (petit, discret)
         mem_path_label = QLabel(f"💾 {self.memory_store.path}")
         mem_path_label.setStyleSheet("color:#555555; font-size:10px;")
         mem_layout.addWidget(mem_path_label)
-
-        # Liste des faits
         self.lt_list = QListWidget()
         self.lt_list.setStyleSheet(
             "background:#1e1e1e; color:#cccccc; font-size:12px; border:1px solid #333;"
@@ -495,8 +497,6 @@ class MainWindow(QMainWindow):
         self.lt_list.setToolTip("Cliquez sur un fait pour le sélectionner, puis ➖ pour le supprimer")
         self._refresh_lt_list()
         mem_layout.addWidget(self.lt_list)
-
-        # Champ + boutons Ajouter / Supprimer / Tout effacer
         lt_input_row = QHBoxLayout()
         lt_input_row.setSpacing(4)
         self.lt_input = QLineEdit()
@@ -520,10 +520,8 @@ class MainWindow(QMainWindow):
         lt_input_row.addWidget(lt_del_btn)
         lt_input_row.addWidget(self.clear_mem_btn)
         mem_layout.addLayout(lt_input_row)
-
         mem_group.setLayout(mem_layout)
         top_row.addWidget(mem_group, stretch=1)
-        # ══════════════════════════════════════════════════════════════════════
 
         root.addLayout(top_row)
         self._on_security_changed()
@@ -535,6 +533,38 @@ class MainWindow(QMainWindow):
         log_header = QHBoxLayout()
         log_header.addWidget(QLabel("Conversation & Étapes ReAct :"))
         root.addLayout(log_header)
+
+        # ── Barre de progression (P3-003) ─────────────────────────────────────
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(8)
+        progress_title = QLabel("Progression :")
+        progress_title.setStyleSheet("color:#aaaaaa;")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 8)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%v/%m")
+        self.progress_bar.setFixedHeight(18)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                background:#1e1e1e;
+                border:1px solid #333333;
+                border-radius:4px;
+                color:#cccccc;
+                height:18px;
+            }
+            QProgressBar::chunk {
+                background-color:#4fc3f7;
+                border-radius:3px;
+            }
+        """)
+        self.progress_label = QLabel("En attente")
+        self.progress_label.setStyleSheet("color:#888888; font-size:12px;")
+        progress_row.addWidget(progress_title)
+        progress_row.addWidget(self.progress_bar, 1)
+        progress_row.addWidget(self.progress_label)
+        root.addLayout(progress_row)
+        # ─────────────────────────────────────────────────────────────────────
 
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
@@ -586,13 +616,11 @@ class MainWindow(QMainWindow):
         if pixmap.isNull():
             self._append_colored(f"\n[screenshot non lisible : {img_path}]\n", "#ff8a65")
             return
-
         if pixmap.width() > SCREENSHOT_MAX_WIDTH:
             pixmap = pixmap.scaledToWidth(
                 SCREENSHOT_MAX_WIDTH,
                 Qt.TransformationMode.SmoothTransformation
             )
-
         doc = self.log_output.document()
         img_name = f"screenshot_{id(img_path)}"
         doc.addResource(
@@ -600,26 +628,32 @@ class MainWindow(QMainWindow):
             __import__('PyQt6.QtCore', fromlist=['QUrl']).QUrl(img_name),
             pixmap
         )
-
         cursor = self.log_output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-
         fmt_text = QTextCharFormat()
         fmt_text.setForeground(QColor(EVENT_COLORS[EVT_SCREENSHOT]))
         cursor.setCharFormat(fmt_text)
         cursor.insertText(f"\n\U0001f4f8 Screenshot ({pixmap.width()}x{pixmap.height()}px) :\n")
-
         img_fmt = QTextImageFormat()
         img_fmt.setName(img_name)
         img_fmt.setWidth(pixmap.width())
         img_fmt.setHeight(pixmap.height())
         cursor.insertImage(img_fmt)
         cursor.insertText("\n")
-
         self.log_output.setTextCursor(cursor)
         self.log_output.ensureCursorVisible()
 
     def _on_event(self, event_type: str, data: str):
+        # ── Progression : parse "Étape N/M" depuis EVT_STEP ──────────────────
+        if event_type == EVT_STEP:
+            m = re.search(r"[EÉ]tape\s+(\d+)/(\d+)", data)
+            if m:
+                self._set_progress(int(m.group(1)), int(m.group(2)), data)
+            else:
+                # Pas de N/M → avance juste le label
+                self.progress_label.setText(data[:60] if data else "…")
+            # On laisse aussi l'affichage texte se faire (pas de return ici)
+
         if event_type == EVT_SCREENSHOT:
             self._insert_screenshot(data)
             return
@@ -669,6 +703,7 @@ class MainWindow(QMainWindow):
         self.submit_button.setEnabled(False)
         self.prompt_input.setEnabled(False)
         self._thinking_started = False
+        self._set_progress(0, 8, "Démarrage…")          # ← P3-003
         self._append_colored(
             f"\n\n\U0001f4ac Vous : {prompt}\n"
             f"\U0001f50c {provider_name} | {model_name}\n"
@@ -687,6 +722,11 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _run_finished(self, success: bool, error: str):
+        # ── Finalise la barre de progression ─────────────────────────────────
+        maximum = self.progress_bar.maximum() or 1
+        self.progress_bar.setValue(maximum)
+        self.progress_label.setText("✅ Terminé" if success else "❌ Échec")
+        # ─────────────────────────────────────────────────────────────────────
         self.submit_button.setEnabled(True)
         self.prompt_input.setEnabled(True)
         self.prompt_input.clear()
