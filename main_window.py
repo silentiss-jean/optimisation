@@ -8,7 +8,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QLineEdit, QLabel, QMessageBox,
     QComboBox, QGroupBox, QFormLayout, QRadioButton, QButtonGroup,
-    QFileDialog, QDialog, QDialogButtonBox, QStackedWidget
+    QFileDialog, QDialog, QDialogButtonBox, QStackedWidget,
+    QListWidget, QListWidgetItem, QSplitter
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat, QPixmap, QTextImageFormat
@@ -221,7 +222,6 @@ class MainWindow(QMainWindow):
         self.dispatcher        = ToolDispatcher()
         self._thinking_started = False
         self._trust_expiry: datetime | None = None
-        # ── Mémoire persistante partagée entre toutes les requêtes ──
         self.memory_store      = MemoryStore()
         self._setup_ui()
 
@@ -346,7 +346,7 @@ class MainWindow(QMainWindow):
         if folder:
             self.scope_input.setText(folder)
 
-    # ─────────────────────────────────────────────────────── clear memory
+    # ─────────────────────────────────────────────────────── memory helpers
     def _clear_memory(self):
         reply = QMessageBox.question(
             self, "Effacer la mémoire",
@@ -355,7 +355,34 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.memory_store.clear_all()
+            self.lt_list.clear()
             self._append_colored("\n🗑️  Mémoire effacée.\n", "#888888")
+
+    def _add_long_term_fact(self):
+        """Ajoute le texte du champ dans la mémoire longue durée."""
+        fact = self.lt_input.text().strip()
+        if not fact:
+            return
+        self.memory_store.add_long_term(fact)
+        self.lt_input.clear()
+        self._refresh_lt_list()
+        self._append_colored(f"\n🧠 Fait mémorisé : {fact}\n", "#b39ddb")
+
+    def _remove_long_term_fact(self):
+        """Supprime le fait sélectionné dans la liste."""
+        item = self.lt_list.currentItem()
+        if not item:
+            return
+        fact = item.text()
+        self.memory_store.remove_long_term(fact)
+        self._refresh_lt_list()
+        self._append_colored(f"\n🗑️  Fait supprimé : {fact}\n", "#888888")
+
+    def _refresh_lt_list(self):
+        """Recharge la liste UI depuis le store."""
+        self.lt_list.clear()
+        for fact in self.memory_store.long_term:
+            self.lt_list.addItem(QListWidgetItem(fact))
 
     # ─────────────────────────────────────────────────────── setup UI
     def _setup_ui(self):
@@ -448,25 +475,65 @@ class MainWindow(QMainWindow):
         sec_layout.addLayout(scope_row)
         sec_group.setLayout(sec_layout)
         top_row.addWidget(sec_group, stretch=1)
+
+        # ══ Panneau mémoire longue durée ══════════════════════════════════════
+        mem_group  = QGroupBox("🧠 Mémoire longue durée")
+        mem_layout = QVBoxLayout()
+        mem_layout.setSpacing(4)
+
+        # Chemin du fichier (petit, discret)
+        mem_path_label = QLabel(f"💾 {self.memory_store.path}")
+        mem_path_label.setStyleSheet("color:#555555; font-size:10px;")
+        mem_layout.addWidget(mem_path_label)
+
+        # Liste des faits
+        self.lt_list = QListWidget()
+        self.lt_list.setStyleSheet(
+            "background:#1e1e1e; color:#cccccc; font-size:12px; border:1px solid #333;"
+        )
+        self.lt_list.setMaximumHeight(90)
+        self.lt_list.setToolTip("Cliquez sur un fait pour le sélectionner, puis ➖ pour le supprimer")
+        self._refresh_lt_list()
+        mem_layout.addWidget(self.lt_list)
+
+        # Champ + boutons Ajouter / Supprimer / Tout effacer
+        lt_input_row = QHBoxLayout()
+        lt_input_row.setSpacing(4)
+        self.lt_input = QLineEdit()
+        self.lt_input.setPlaceholderText("Nouveau fait… (ex: préfère qwen3:14b)")
+        self.lt_input.setFixedHeight(28)
+        self.lt_input.returnPressed.connect(self._add_long_term_fact)
+        lt_add_btn = QPushButton("➕")
+        lt_add_btn.setFixedSize(28, 28)
+        lt_add_btn.setToolTip("Ajouter ce fait à la mémoire longue durée")
+        lt_add_btn.clicked.connect(self._add_long_term_fact)
+        lt_del_btn = QPushButton("➖")
+        lt_del_btn.setFixedSize(28, 28)
+        lt_del_btn.setToolTip("Supprimer le fait sélectionné")
+        lt_del_btn.clicked.connect(self._remove_long_term_fact)
+        self.clear_mem_btn = QPushButton("🗑️")
+        self.clear_mem_btn.setFixedSize(28, 28)
+        self.clear_mem_btn.setToolTip("Effacer TOUTE la mémoire (session + longue durée)")
+        self.clear_mem_btn.clicked.connect(self._clear_memory)
+        lt_input_row.addWidget(self.lt_input)
+        lt_input_row.addWidget(lt_add_btn)
+        lt_input_row.addWidget(lt_del_btn)
+        lt_input_row.addWidget(self.clear_mem_btn)
+        mem_layout.addLayout(lt_input_row)
+
+        mem_group.setLayout(mem_layout)
+        top_row.addWidget(mem_group, stretch=1)
+        # ══════════════════════════════════════════════════════════════════════
+
         root.addLayout(top_row)
         self._on_security_changed()
         self.scope_label.setVisible(False)
         self.scope_input.setVisible(False)
         self.scope_browse.setVisible(False)
 
-        # ── Titre log + bouton mémoire ──
+        # ── Titre log
         log_header = QHBoxLayout()
         log_header.addWidget(QLabel("Conversation & Étapes ReAct :"))
-        log_header.addStretch()
-        # Info fichier mémoire
-        mem_path_label = QLabel(f"💾 {self.memory_store.path}")
-        mem_path_label.setStyleSheet("color:#555555; font-size:11px;")
-        log_header.addWidget(mem_path_label)
-        self.clear_mem_btn = QPushButton("🗑️ Effacer mémoire")
-        self.clear_mem_btn.setFixedHeight(28)
-        self.clear_mem_btn.setToolTip("Efface l'historique de session et la mémoire longue durée")
-        self.clear_mem_btn.clicked.connect(self._clear_memory)
-        log_header.addWidget(self.clear_mem_btn)
         root.addLayout(log_header)
 
         self.log_output = QTextEdit()
@@ -475,7 +542,6 @@ class MainWindow(QMainWindow):
             "background-color:#1e1e1e; color:#cccccc;"
             "font-family:'Consolas',monospace; font-size:13px;"
         )
-        # Afficher infos mémoire au démarrage
         hist_count = len(self.memory_store.session_history)
         lt_count   = len(self.memory_store.long_term)
         self._append_colored(
@@ -609,7 +675,6 @@ class MainWindow(QMainWindow):
             f"\U0001f6e1\ufe0f  {badge_label}{' | scope: ' + scope if scope else ''}\n",
             "#aaaaaa"
         )
-        # Passer le MemoryStore + l'historique courant au worker
         current_history = list(self.memory_store.session_history)
         self.worker = LLMWorker(
             prompt, provider, self.dispatcher, mode, scope,
