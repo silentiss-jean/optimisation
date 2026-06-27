@@ -11,11 +11,6 @@ except ImportError:
 
 
 class _PlaywrightSession:
-    """
-    Session Playwright liée au thread courant.
-    Une seule fenêtre (BrowserContext) est partagée — les onglets s'y ajoutent.
-    Recréée automatiquement si thread différent ou fenêtre fermée.
-    """
     _instance: Optional["_PlaywrightSession"] = None
     _owner_thread: Optional[int] = None
 
@@ -23,7 +18,7 @@ class _PlaywrightSession:
         self._playwright  = None
         self._browser: Optional[Browser]        = None
         self._context: Optional[BrowserContext] = None
-        self._page: Optional[Page]              = None   # onglet actif
+        self._page: Optional[Page]              = None
 
     @classmethod
     def get(cls) -> "_PlaywrightSession":
@@ -31,11 +26,10 @@ class _PlaywrightSession:
         if cls._instance is None or cls._owner_thread != current:
             if cls._instance is not None:
                 cls._instance._teardown()
-            cls._instance    = _PlaywrightSession()
+            cls._instance     = _PlaywrightSession()
             cls._owner_thread = current
         return cls._instance
 
-    # ------------------------------------------------------------------
     def _teardown(self):
         for obj in (self._context, self._browser, self._playwright):
             try:
@@ -63,26 +57,28 @@ class _PlaywrightSession:
         try:
             self._playwright = sync_playwright().start()
             self._browser    = self._playwright.chromium.launch(headless=False)
-            self._context    = self._browser.new_context()
+            # ignore_https_errors=True : accepte les certs auto-signés et
+            # les erreurs SSL sur les sites locaux (http:// compris)
+            self._context    = self._browser.new_context(
+                ignore_https_errors=True
+            )
             self._page       = self._context.new_page()
             return True
         except Exception:
             self._teardown()
             return False
 
-    # ------------------------------------------------------------------
     @property
     def page(self) -> Optional[Page]:
         return self._page
 
     def new_tab(self, url: str) -> str:
-        """Ouvre un nouvel onglet dans la MEME fenêtre et l'active."""
         if not self._context:
             return "[ERREUR] Aucun contexte navigateur actif."
         try:
             tab = self._context.new_page()
-            tab.goto(url, wait_until="domcontentloaded", timeout=8000)
-            self._page = tab   # l'onglet devient l'onglet actif
+            tab.goto(url, wait_until="load", timeout=15000)
+            self._page = tab
             return f"[DONE] Nouvel onglet ouvert : {tab.url}"
         except Exception as e:
             return f"[ERREUR browser_new_tab] {str(e).split(chr(10))[0]}"
@@ -93,25 +89,49 @@ class _PlaywrightSession:
         _PlaywrightSession._owner_thread = None
 
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _normalize_url(url: str) -> str:
+    """Préfixe https:// uniquement si aucun schéma n'est présent."""
+    if not url.startswith(("http://", "https://")):
+        return "https://" + url
+    return url
+
+
+def _goto(page: Page, url: str, timeout: int = 15000) -> str:
+    """
+    Navigue vers url avec fallback progressif sur wait_until :
+      load → domcontentloaded → commit
+    Retourne l'URL finale ou lève l'exception du dernier essai.
+    """
+    for wait in ("load", "domcontentloaded", "commit"):
+        try:
+            page.goto(url, wait_until=wait, timeout=timeout)
+            return page.url
+        except Exception as e:
+            last_exc = e
+    raise last_exc
+
+
 # ─── Actions ─────────────────────────────────────────────────────────────────
 
 class BrowserNavigateTool(Tool):
     def __init__(self):
         super().__init__(
             name="browser_navigate",
-            description="Naviguer vers une URL dans l'onglet actif du navigateur.",
+            description="Naviguer vers une URL dans l'onglet actif du navigateur. Fonctionne aussi pour les sites locaux (http://) et les certificats auto-signés.",
             parameters={"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}
         )
+
     def execute(self, url: str, **kwargs) -> str:
-        if not url.startswith(("http://","https://")):
-            url = "https://" + url
+        url = _normalize_url(url)
         session = _PlaywrightSession.get()
         if not session.start():
             import webbrowser; webbrowser.open(url)
             return f"[FALLBACK] Playwright indisponible. Ouvert via webbrowser : {url}"
         try:
-            session.page.goto(url, wait_until="domcontentloaded", timeout=8000)
-            return f"[DONE] Navigé vers : {session.page.url}"
+            final_url = _goto(session.page, url)
+            return f"[DONE] Navigé vers : {final_url}"
         except Exception as e:
             return f"[ERREUR browser_navigate] {str(e).split(chr(10))[0]}. Essaie une URL alternative."
 
@@ -120,12 +140,12 @@ class BrowserNewTabTool(Tool):
     def __init__(self):
         super().__init__(
             name="browser_new_tab",
-            description="Ouvrir une URL dans un NOUVEL ONGLET de la fenêtre existante (sans ouvrir une nouvelle fenêtre).",
+            description="Ouvrir une URL dans un NOUVEL ONGLET de la fenêtre existante (sans ouvrir une nouvelle fenêtre). Fonctionne aussi pour les sites locaux (http://).",
             parameters={"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}
         )
+
     def execute(self, url: str, **kwargs) -> str:
-        if not url.startswith(("http://","https://")):
-            url = "https://" + url
+        url = _normalize_url(url)
         session = _PlaywrightSession.get()
         if not session.start():
             import webbrowser; webbrowser.open(url)
