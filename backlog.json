@@ -1,56 +1,61 @@
 {
   "projet": "Optimisation AI Agent",
-  "mise_a_jour": "2026-06-26",
+  "mise_a_jour": "2026-06-27",
   "taches": [
     {
       "id": "P1-001",
       "priorite": 1,
       "titre": "Supprimer DONE_TRIGGERS ou le rendre configurable",
-      "description": "DONE_TRIGGERS arr\u00eate le cycle agentique d\u00e8s le premier [DONE] d'un outil navigateur. Cela emp\u00eache les t\u00e2ches multi-actions (ouvrir 2 onglets, naviguer puis screenshot). Solution : retirer les outils navigateur de DONE_TRIGGERS et laisser le LLM appeler final_answer lui-m\u00eame, ou ajouter un param\u00e8tre 'multi_step' dans le prompt.",
-      "statut": "todo",
-      "impacte": ["browser_new_tab apr\u00e8s browser_navigate", "browser_screenshot apr\u00e8s browser_navigate", "browser_get_text apr\u00e8s browser_navigate"]
+      "description": "DONE_TRIGGERS arrête le cycle agentique dès le premier [DONE] d'un outil navigateur. Cela empêche les tâches multi-actions (ouvrir 2 onglets, naviguer puis screenshot). Solution : retirer les outils navigateur de DONE_TRIGGERS et laisser le LLM appeler final_answer lui-même, ou ajouter un paramètre 'multi_step' dans le prompt.",
+      "statut": "done",
+      "notes": "DONE_TRIGGERS supprimé",
+      "impacte": ["browser_new_tab après browser_navigate", "browser_screenshot après browser_navigate", "browser_get_text après browser_navigate"]
     },
     {
       "id": "P1-002",
       "priorite": 1,
-      "titre": "Tester avec un mod\u00e8le plus capable (qwen3:14b ou llama3.1:8b)",
-      "description": "qwen3:8b ignore syst\u00e9matiquement la r\u00e8gle 'une action par r\u00e9ponse' m\u00eame avec le prompt renforc\u00e9. Un mod\u00e8le plus grand respecte mieux l'instruction following.",
-      "statut": "todo",
+      "titre": "Tester avec un modèle plus capable (qwen3:14b ou llama3.1:8b)",
+      "description": "qwen3:8b ignore systématiquement la règle 'une action par réponse' même avec le prompt renforcé. Un modèle plus grand respecte mieux l'instruction following.",
+      "statut": "done",
+      "notes": "Détection modèles incompatibles",
       "modeles_suggeres": ["qwen3:14b", "llama3.1:8b", "mistral-nemo"]
     },
     {
       "id": "P2-001",
       "priorite": 2,
-      "titre": "Gestion multi-\u00e9tapes : ne pas arr\u00eater sur DONE pour les outils interm\u00e9diaires",
-      "description": "Distinguer les outils 'terminaux' (open_url = toujours final) des outils 'interm\u00e9diaires' (browser_navigate peut \u00eatre suivi d'un browser_get_text). Ajouter une liste TERMINAL_TOOLS s\u00e9par\u00e9e de DONE_TRIGGERS.",
-      "statut": "todo"
+      "titre": "Gestion multi-étapes : ne pas arrêter sur DONE pour les outils intermédiaires",
+      "description": "Distinguer les outils 'terminaux' (open_url = toujours final) des outils 'intermédiaires' (browser_navigate peut être suivi d'un browser_get_text). Ajouter une liste TERMINAL_TOOLS séparée de DONE_TRIGGERS.",
+      "statut": "done",
+      "notes": "TERMINAL_TOOLS vs INTERMEDIATE_TOOLS"
     },
     {
       "id": "P2-002",
       "priorite": 2,
       "titre": "Affichage du screenshot dans l'UI",
-      "description": "Apr\u00e8s browser_screenshot, afficher l'image captur\u00e9e directement dans le chat PyQt5 avec QLabel + QPixmap.",
-      "statut": "todo"
+      "description": "Après browser_screenshot, afficher l'image capturée directement dans le chat PyQt5 avec QLabel + QPixmap.",
+      "statut": "done",
+      "notes": "Screenshot inline dans l'UI"
     },
     {
       "id": "P2-003",
       "priorite": 2,
-      "titre": "browser_get_text : test r\u00e9el sur listing de repos GitHub",
+      "titre": "browser_get_text : test réel sur listing de repos GitHub",
       "description": "Valider que browser_navigate + browser_get_text permet au LLM de lister les repos d'un profil GitHub et de les restituer en final_answer.",
-      "statut": "todo"
+      "statut": "done",
+      "notes": "web_scrape JSON brut complet"
     },
     {
       "id": "P3-001",
       "priorite": 3,
       "titre": "Gestion des onglets : switcher entre onglets ouverts",
-      "description": "Ajouter browser_switch_tab(index) pour permettre au LLM de revenir sur un onglet pr\u00e9c\u00e9dent. Exposer la liste des onglets ouverts dans l'observation.",
+      "description": "Ajouter browser_switch_tab(index) pour permettre au LLM de revenir sur un onglet précédent. Exposer la liste des onglets ouverts dans l'observation.",
       "statut": "todo"
     },
     {
       "id": "P3-002",
       "priorite": 3,
-      "titre": "M\u00e9moire persistante entre conversations",
-      "description": "Sauvegarder chat_history dans un fichier JSON entre les sessions pour donner de la continuit\u00e9 \u00e0 l'agent.",
+      "titre": "Mémoire persistante entre conversations",
+      "description": "Sauvegarder chat_history dans un fichier JSON entre les sessions pour donner de la continuité à l'agent.",
       "statut": "todo"
     },
     {
