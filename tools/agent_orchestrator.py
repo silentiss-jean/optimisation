@@ -30,6 +30,10 @@ Règles ABSOLUES — à respecter sans exception :
    Ne jamais utiliser command_line_execute pour naviguer sur le web.
 10. Pour lister les repos GitHub d'un utilisateur : utilise web_scrape avec
     https://api.github.com/users/{{username}}/repos — c'est plus fiable que de scraper le DOM.
+11. Certains outils LIVRENT directement une information (browser_get_text, web_scrape, read_file,
+    command_line_execute, browser_screenshot) — leur observation EST la réponse à la question.
+    Lis l'observation et appelle immédiatement final_answer avec cette information.
+    Ne navigue PAS vers une page si tu viens déjà de récupérer la donnée demandée.
 
 Historique de la conversation :
 {history}
@@ -37,13 +41,14 @@ Historique de la conversation :
 Tâche : {task}"""
 
 
-EVT_THINKING = "thinking"
-EVT_ACTION   = "action"
-EVT_OBSERVE  = "observe"
-EVT_ANSWER   = "answer"
-EVT_STEP     = "step"
-EVT_WARNING  = "warning"
-EVT_SECURITY = "security"
+EVT_THINKING   = "thinking"
+EVT_ACTION     = "action"
+EVT_OBSERVE    = "observe"
+EVT_ANSWER     = "answer"
+EVT_STEP       = "step"
+EVT_WARNING    = "warning"
+EVT_SECURITY   = "security"
+EVT_SCREENSHOT = "screenshot"   # nouveau — data = chemin absolu vers l'image
 
 # Nombre de caractères affichés dans le log UI pour une observation
 OBS_UI_MAX   = 2000
@@ -72,9 +77,20 @@ ALLOWED_TOOLS: Dict[str, set] = {
     },
 }
 
-INFO_TOOLS: set = {
+# Outils qui LIVRENT une donnée — l'observation est la réponse, pas une étape intermédiaire.
+# Leur hint pousse l'agent à appeler final_answer immédiatement avec le contenu reçu.
+TERMINAL_TOOLS: set = {
+    "web_scrape", "browser_get_text", "read_file",
+    "command_line_execute", "browser_screenshot",
+}
+
+# Outils qui exécutent une action sans livrer de donnée directement utile à l'utilisateur.
+# Leur hint indique à l'agent de continuer si d'autres étapes sont nécessaires, ou d'appeler
+# final_answer si toutes les tâches sont terminées.
+INTERMEDIATE_TOOLS: set = {
     "browser_navigate", "browser_new_tab", "browser_click",
-    "browser_fill", "browser_screenshot", "open_url",
+    "browser_fill", "browser_scroll", "browser_wait_for", "open_url",
+    "write_file", "find_files",
 }
 
 
@@ -133,11 +149,9 @@ def _compact_github_repos(raw: str) -> str:
     Retourne raw intact si aucun repo détecté.
     """
     stripped = raw.strip()
-    # Détection rapide : la réponse doit ressembler à du JSON de repos GitHub
     if 'html_url' not in stripped or 'full_name' not in stripped:
         return raw
 
-    # Tentative parse complet d'abord
     if stripped.startswith('['):
         try:
             repos = json.loads(stripped)
@@ -151,7 +165,6 @@ def _compact_github_repos(raw: str) -> str:
         except json.JSONDecodeError:
             pass
 
-    # Fallback : extraire objet par objet même si le tableau est tronqué
     objects = _extract_json_objects(stripped)
     repos = [o for o in objects if 'name' in o and 'html_url' in o and 'full_name' in o]
     if repos:
@@ -160,10 +173,24 @@ def _compact_github_repos(raw: str) -> str:
             f"({r.get('html_url', '')})"
             for r in repos
         ]
-        suffix = " (liste potentiellement partielle — réponse API tronquée)" if not stripped.endswith(']') else ""
+        suffix = " (liste potentiellement partielle)" if not stripped.endswith(']') else ""
         return f"Repos GitHub ({len(lines)}{suffix}) :\n" + "\n".join(lines)
 
     return raw
+
+
+def _extract_screenshot_path(obs: str) -> Optional[str]:
+    """
+    Si l'observation d'un browser_screenshot contient un chemin de fichier image,
+    le retourne. Sinon retourne None.
+    Format attendu: "[DONE] Screenshot sauvegardé : /chemin/absolu/screenshot.png"
+    """
+    m = re.search(r'Screenshot sauvegardé\s*:\s*(.+\.png)', obs)
+    if m:
+        path = m.group(1).strip()
+        import os
+        return path if os.path.isfile(path) else None
+    return None
 
 
 class AgentOrchestrator:
@@ -192,15 +219,15 @@ class AgentOrchestrator:
         allowed_set = ALLOWED_TOOLS.get(self.security_mode, set())
         if tool_name not in allowed_set:
             if self.security_mode == SecurityMode.MONITORING:
-                return False, "🛑 Action bloquée : mode MONITORING actif."
+                return False, "\U0001f6d1 Action bloquée : mode MONITORING actif."
             return False, (
-                f"🛑 Outil '{tool_name}' non autorisé en mode {self.security_mode}. "
+                f"\U0001f6d1 Outil '{tool_name}' non autorisé en mode {self.security_mode}. "
                 f"Outils disponibles : {', '.join(sorted(allowed_set)) or 'aucun'}."
             )
         if self.security_mode == SecurityMode.LIMITED_SCOPE and self.current_scope:
             path = params.get('file_path') or params.get('directory', '')
             if path and not str(path).startswith(self.current_scope):
-                return False, f"🛑 Chemin '{path}' hors du scope autorisé '{self.current_scope}'."
+                return False, f"\U0001f6d1 Chemin '{path}' hors du scope autorisé '{self.current_scope}'."
         return True, ""
 
     def _build_system_prompt(self, task: str) -> str:
@@ -224,8 +251,8 @@ class AgentOrchestrator:
     def _parse_llm_response(self, raw: str) -> tuple[Optional[Dict], bool]:
         """
         Extrait le PREMIER objet JSON valide de la réponse.
-        Strippes les blocs <think> avant parsing pour éviter les faux positifs.
-        Retourne (parsed, had_multiple) où had_multiple=True si plusieurs JSON détectés.
+        Strippes les blocs <think> avant parsing.
+        Retourne (parsed, had_multiple).
         """
         raw = _strip_think_blocks(raw)
         candidates = [m.start() for m in re.finditer(r'\{', raw)]
@@ -316,21 +343,35 @@ class AgentOrchestrator:
                 observation = self.dispatcher.dispatch_call(tool_name=tool_name, **params)
                 obs_str = str(observation)
 
-                # Compacter les réponses JSON verbeux (repos GitHub, etc.) même si tronquées
+                # Compacter les réponses JSON verbeux (repos GitHub, etc.)
                 obs_compact = _compact_github_repos(obs_str)
 
-                # Hints selon le préfixe
-                if obs_compact.startswith("[DONE]"):
-                    obs_for_llm = (
-                        obs_compact +
-                        "\n→ Action réussie. Si toutes les tâches demandées sont terminées, "
-                        "appelle final_answer maintenant."
-                    )
-                elif obs_compact.startswith("[ERREUR]"):
+                # --- P2-002 : détecter un screenshot et émettre l'événement dédié
+                if tool_name == "browser_screenshot":
+                    img_path = _extract_screenshot_path(obs_compact)
+                    if img_path:
+                        self._emit(EVT_SCREENSHOT, img_path)
+
+                # --- P2-001 : hints différenciés selon la catégorie de l'outil
+                if obs_compact.startswith("[ERREUR]"):
                     obs_for_llm = (
                         obs_compact +
                         "\n→ Cet outil a échoué. Utilise un outil DIFFÉRENT ou appelle "
                         "final_answer pour expliquer l'échec. Ne répète PAS la même commande."
+                    )
+                elif tool_name in TERMINAL_TOOLS:
+                    # L'outil a livré une donnée : l'agent doit lire et répondre
+                    obs_for_llm = (
+                        obs_compact +
+                        "\n→ Donnée reçue. Lis l'observation ci-dessus et appelle "
+                        "final_answer avec cette information. N'utilise plus d'outils."
+                    )
+                elif tool_name in INTERMEDIATE_TOOLS:
+                    # L'outil a exécuté une action intermédiaire
+                    obs_for_llm = (
+                        obs_compact +
+                        "\n→ Action exécutée. Si d'autres étapes sont nécessaires, "
+                        "continue. Sinon appelle final_answer."
                     )
                 else:
                     obs_for_llm = obs_compact

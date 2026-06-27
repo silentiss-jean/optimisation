@@ -10,8 +10,8 @@ from PyQt6.QtWidgets import (
     QComboBox, QGroupBox, QFormLayout, QRadioButton, QButtonGroup,
     QFileDialog, QDialog, QDialogButtonBox, QStackedWidget
 )
-from PyQt6.QtCore import QThread, pyqtSignal
-from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat
+from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat, QPixmap, QTextImageFormat
 
 from providers.llm_provider_interface import LLMProvider
 from providers.ollama_provider import OllamaProvider
@@ -22,10 +22,10 @@ from tools.tool_dispatcher import ToolDispatcher
 from tools.agent_orchestrator import (
     AgentOrchestrator, SecurityMode,
     EVT_THINKING, EVT_ACTION, EVT_OBSERVE, EVT_ANSWER,
-    EVT_STEP, EVT_WARNING, EVT_SECURITY
+    EVT_STEP, EVT_WARNING, EVT_SECURITY, EVT_SCREENSHOT
 )
 
-# ─────────────────────────────────────────────────────────── providers
+# ─────────────────────────────────────────────────────────────────── providers
 PROVIDER_DEFAULTS = {
     "Ollama (local)": "qwen3:8b",
     "LM Studio (local)": "local-model",
@@ -53,21 +53,25 @@ START_COMMANDS = {
     "LM Studio (local)": "Lancez LM Studio et activez \"Local Server\" dans l'interface.",
 }
 
-# Modèles connus pour être incompatibles avec l'architecture ReAct (multi-JSON, pas d'historique)
+# Modèles connus pour être incompatibles avec l'architecture ReAct
 REACT_INCOMPATIBLE_PATTERNS = [
     "llama3.1", "llama3:8b", "llama3.1:8b", "llama3.1:70b",
     "llama2", "mistral:7b", "mistral:latest",
 ]
 
+# Largeur maximale des screenshots affichés inline dans le log (px)
+SCREENSHOT_MAX_WIDTH = 780
+
 # ────────────────────────────────────────────────────── streaming colors
 EVENT_COLORS = {
-    EVT_STEP:     "#888888",
-    EVT_THINKING: "#cccccc",
-    EVT_ACTION:   "#4fc3f7",
-    EVT_OBSERVE:  "#81c784",
-    EVT_ANSWER:   "#fff176",
-    EVT_WARNING:  "#ff8a65",
-    EVT_SECURITY: "#ef5350",
+    EVT_STEP:       "#888888",
+    EVT_THINKING:   "#cccccc",
+    EVT_ACTION:     "#4fc3f7",
+    EVT_OBSERVE:    "#81c784",
+    EVT_ANSWER:     "#fff176",
+    EVT_WARNING:    "#ff8a65",
+    EVT_SECURITY:   "#ef5350",
+    EVT_SCREENSHOT: "#b39ddb",  # violet doux pour l'en-tête screenshot
 }
 EVENT_PREFIX = {
     EVT_STEP:     "\n\u254d\u254d\u254d {data} \u254d\u254d\u254d",
@@ -94,7 +98,6 @@ TRUST_DURATIONS = [
 
 
 def _local_server_error_msg(provider_name: str, url: str, exc: Exception) -> str:
-    """Construit un message d'erreur actionnable quand le serveur local ne répond pas."""
     cmd = START_COMMANDS.get(provider_name, f"Démarrez {provider_name}.")
     reason = str(exc)
     if "Connection refused" in reason or "111" in reason:
@@ -109,12 +112,11 @@ def _local_server_error_msg(provider_name: str, url: str, exc: Exception) -> str
         f"{detail}\n\n"
         f"Pour démarrer {provider_name} :\n"
         f"  {cmd}\n\n"
-        f"Le modèle par défaut reste sélectionné — vous pouvez continuer à le taper manuellement."
+        f"Le modèle par défaut reste sélectionné \u2014 vous pouvez continuer à le taper manuellement."
     )
 
 
 def _is_react_incompatible(model_name: str) -> bool:
-    """Retourne True si le modèle est connu pour être incompatible avec l'architecture ReAct."""
     name_lower = model_name.lower()
     return any(pattern in name_lower for pattern in REACT_INCOMPATIBLE_PATTERNS)
 
@@ -162,7 +164,7 @@ class TrustDialog(QDialog):
         self.accept()
 
 
-# ═══════════════════════════════════════════════════════════ Worker
+# ═══════════════════════════════════════════════════════════════════ Worker
 class LLMWorker(QThread):
     event_signal    = pyqtSignal(str, str)
     finished_signal = pyqtSignal(bool, str)
@@ -207,7 +209,7 @@ class LLMWorker(QThread):
                 self.finished_signal.emit(False, err)
 
 
-# ═══════════════════════════════════════════════════════════ MainWindow
+# ═══════════════════════════════════════════════════════════════════ MainWindow
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -218,7 +220,7 @@ class MainWindow(QMainWindow):
         self._trust_expiry: datetime | None = None
         self._setup_ui()
 
-    # ──────────────────────────────── fetch models from local server
+    # ────────────────────────────────── fetch models from local server
     def _fetch_local_models(self):
         choice = self.provider_combo.currentText()
         if choice not in MODEL_LIST_ENDPOINTS:
@@ -242,7 +244,7 @@ class MainWindow(QMainWindow):
             msg = _local_server_error_msg(choice, url, e)
             QMessageBox.warning(self, f"{choice} injoignable", msg)
 
-    # ──────────────────────────────── build provider
+    # ────────────────────────────────── build provider
     def _build_provider(self) -> LLMProvider:
         choice = self.provider_combo.currentText()
         if choice in LOCAL_PROVIDERS:
@@ -285,7 +287,6 @@ class MainWindow(QMainWindow):
             self.model_combo.addItem(PROVIDER_DEFAULTS.get(choice, ""))
 
     def _on_model_changed(self, _index: int):
-        """Avertit si le modèle sélectionné est connu incompatible ReAct."""
         model = self.model_combo.currentText().strip()
         if model and _is_react_incompatible(model):
             self._append_colored(
@@ -475,7 +476,57 @@ class MainWindow(QMainWindow):
         self.log_output.setTextCursor(cursor)
         self.log_output.ensureCursorVisible()
 
+    def _insert_screenshot(self, img_path: str):
+        """
+        Insère une image inline dans le log PyQt6.
+        L'image est redimensionnée si elle dépasse SCREENSHOT_MAX_WIDTH.
+        """
+        pixmap = QPixmap(img_path)
+        if pixmap.isNull():
+            self._append_colored(f"\n[screenshot non lisible : {img_path}]\n", "#ff8a65")
+            return
+
+        if pixmap.width() > SCREENSHOT_MAX_WIDTH:
+            pixmap = pixmap.scaledToWidth(
+                SCREENSHOT_MAX_WIDTH,
+                Qt.TransformationMode.SmoothTransformation
+            )
+
+        # Enregistrer le pixmap dans le document pour pouvoir l'insérer par nom
+        doc = self.log_output.document()
+        img_name = f"screenshot_{id(img_path)}"
+        doc.addResource(
+            doc.ResourceType.ImageResource,  # type: ignore[attr-defined]
+            __import__('PyQt6.QtCore', fromlist=['QUrl']).QUrl(img_name),
+            pixmap
+        )
+
+        cursor = self.log_output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        # En-tête
+        fmt_text = QTextCharFormat()
+        fmt_text.setForeground(QColor(EVENT_COLORS[EVT_SCREENSHOT]))
+        cursor.setCharFormat(fmt_text)
+        cursor.insertText(f"\n\U0001f4f8 Screenshot ({pixmap.width()}x{pixmap.height()}px) :\n")
+
+        # Image inline
+        img_fmt = QTextImageFormat()
+        img_fmt.setName(img_name)
+        img_fmt.setWidth(pixmap.width())
+        img_fmt.setHeight(pixmap.height())
+        cursor.insertImage(img_fmt)
+        cursor.insertText("\n")
+
+        self.log_output.setTextCursor(cursor)
+        self.log_output.ensureCursorVisible()
+
     def _on_event(self, event_type: str, data: str):
+        # ─ screenshot : insertion inline spéciale
+        if event_type == EVT_SCREENSHOT:
+            self._insert_screenshot(data)
+            return
+
         color   = EVENT_COLORS.get(event_type, "#cccccc")
         pattern = EVENT_PREFIX.get(event_type, "{data}")
         if event_type == EVT_THINKING:
