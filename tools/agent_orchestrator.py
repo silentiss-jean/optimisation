@@ -83,30 +83,87 @@ def _strip_think_blocks(text: str) -> str:
     return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
 
+def _extract_json_objects(text: str) -> list[dict]:
+    """
+    Extrait tous les objets JSON valides et complets d'une chaîne,
+    même si la chaîne globale est tronquée (tableau incomplet).
+    """
+    objects = []
+    i = 0
+    while i < len(text):
+        if text[i] != '{':
+            i += 1
+            continue
+        depth = 0
+        in_string = False
+        escape_next = False
+        j = i
+        while j < len(text):
+            c = text[j]
+            if escape_next:
+                escape_next = False
+            elif c == '\\' and in_string:
+                escape_next = True
+            elif c == '"':
+                in_string = not in_string
+            elif not in_string:
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[i:j + 1]
+                        try:
+                            obj = json.loads(candidate)
+                            if isinstance(obj, dict):
+                                objects.append(obj)
+                        except json.JSONDecodeError:
+                            pass
+                        break
+            j += 1
+        i = j + 1
+    return objects
+
+
 def _compact_github_repos(raw: str) -> str:
     """
-    Si la réponse ressemble à un tableau JSON de repos GitHub, retourne
-    une liste compacte nom | description au lieu du JSON brut verbeux.
-    Sinon retourne raw intact.
+    Détecte une réponse contenant des objets repo GitHub (complets ou tronqués)
+    et retourne une liste lisible nom : description (url).
+    Fonctionne même si le JSON global est incomplet/tronqué.
+    Retourne raw intact si aucun repo détecté.
     """
-    raw_stripped = raw.strip()
-    if not raw_stripped.startswith('['):
+    stripped = raw.strip()
+    # Détection rapide : la réponse doit ressembler à du JSON de repos GitHub
+    if 'html_url' not in stripped or 'full_name' not in stripped:
         return raw
-    try:
-        repos = json.loads(raw_stripped)
-        if not isinstance(repos, list) or not repos:
-            return raw
-        if not isinstance(repos[0], dict) or 'name' not in repos[0]:
-            return raw
-        lines = []
-        for r in repos:
-            name = r.get('name', '')
-            desc = r.get('description') or '(pas de description)'
-            url  = r.get('html_url', '')
-            lines.append(f"- {name} : {desc}  ({url})")
-        return "Repos GitHub :\n" + "\n".join(lines)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return raw
+
+    # Tentative parse complet d'abord
+    if stripped.startswith('['):
+        try:
+            repos = json.loads(stripped)
+            if isinstance(repos, list) and repos and 'name' in repos[0]:
+                lines = [
+                    f"- {r.get('name', '?')} : {r.get('description') or '(pas de description)'}  "
+                    f"({r.get('html_url', '')})"
+                    for r in repos if isinstance(r, dict)
+                ]
+                return "Repos GitHub (" + str(len(lines)) + ") :\n" + "\n".join(lines)
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback : extraire objet par objet même si le tableau est tronqué
+    objects = _extract_json_objects(stripped)
+    repos = [o for o in objects if 'name' in o and 'html_url' in o and 'full_name' in o]
+    if repos:
+        lines = [
+            f"- {r.get('name', '?')} : {r.get('description') or '(pas de description)'}  "
+            f"({r.get('html_url', '')})"
+            for r in repos
+        ]
+        suffix = " (liste potentiellement partielle — réponse API tronquée)" if not stripped.endswith(']') else ""
+        return f"Repos GitHub ({len(lines)}{suffix}) :\n" + "\n".join(lines)
+
+    return raw
 
 
 class AgentOrchestrator:
@@ -259,7 +316,7 @@ class AgentOrchestrator:
                 observation = self.dispatcher.dispatch_call(tool_name=tool_name, **params)
                 obs_str = str(observation)
 
-                # Compacter les réponses JSON verbeux (repos GitHub, etc.)
+                # Compacter les réponses JSON verbeux (repos GitHub, etc.) même si tronquées
                 obs_compact = _compact_github_repos(obs_str)
 
                 # Hints selon le préfixe
