@@ -5,6 +5,12 @@ from typing import Dict, Any, Optional, Callable
 from providers.llm_provider_interface import LLMProvider
 from tools.tool_dispatcher import ToolDispatcher
 
+# Import optionnel : MemoryStore peut être None si non fourni
+try:
+    from tools.memory_store import MemoryStore
+except ImportError:
+    MemoryStore = None  # type: ignore
+
 
 SYSTEM_PROMPT_TEMPLATE = """Tu es un agent IA autonome. Tu dois accomplir la tâche demandée en utilisant les outils disponibles.
 
@@ -33,8 +39,8 @@ Règles ABSOLUES — à respecter sans exception :
 11. Certains outils LIVRENT directement une information (browser_get_text, web_scrape, read_file,
     command_line_execute, browser_screenshot) — leur observation EST la réponse à la question.
     Lis l'observation et appelle immédiatement final_answer avec cette information.
-    Ne navigue PAS vers une page si tu viens déjà de récupérer la donnée demandée.
-
+    Ne navigue PAS vers une page si tu viens déjà de récupéré la donnée demandée.
+{memory_section}
 Historique de la conversation :
 {history}
 
@@ -48,7 +54,7 @@ EVT_ANSWER     = "answer"
 EVT_STEP       = "step"
 EVT_WARNING    = "warning"
 EVT_SECURITY   = "security"
-EVT_SCREENSHOT = "screenshot"   # nouveau — data = chemin absolu vers l'image
+EVT_SCREENSHOT = "screenshot"   # data = chemin absolu vers l'image
 
 # Nombre de caractères affichés dans le log UI pour une observation
 OBS_UI_MAX   = 2000
@@ -78,15 +84,12 @@ ALLOWED_TOOLS: Dict[str, set] = {
 }
 
 # Outils qui LIVRENT une donnée — l'observation est la réponse, pas une étape intermédiaire.
-# Leur hint pousse l'agent à appeler final_answer immédiatement avec le contenu reçu.
 TERMINAL_TOOLS: set = {
     "web_scrape", "browser_get_text", "read_file",
     "command_line_execute", "browser_screenshot",
 }
 
-# Outils qui exécutent une action sans livrer de donnée directement utile à l'utilisateur.
-# Leur hint indique à l'agent de continuer si d'autres étapes sont nécessaires, ou d'appeler
-# final_answer si toutes les tâches sont terminées.
+# Outils qui exécutent une action sans livrer de donnée directement utile.
 INTERMEDIATE_TOOLS: set = {
     "browser_navigate", "browser_new_tab", "browser_click",
     "browser_fill", "browser_scroll", "browser_wait_for", "open_url",
@@ -100,10 +103,6 @@ def _strip_think_blocks(text: str) -> str:
 
 
 def _extract_json_objects(text: str) -> list[dict]:
-    """
-    Extrait tous les objets JSON valides et complets d'une chaîne,
-    même si la chaîne globale est tronquée (tableau incomplet).
-    """
     objects = []
     i = 0
     while i < len(text):
@@ -142,12 +141,6 @@ def _extract_json_objects(text: str) -> list[dict]:
 
 
 def _compact_github_repos(raw: str) -> str:
-    """
-    Détecte une réponse contenant des objets repo GitHub (complets ou tronqués)
-    et retourne une liste lisible nom : description (url).
-    Fonctionne même si le JSON global est incomplet/tronqué.
-    Retourne raw intact si aucun repo détecté.
-    """
     stripped = raw.strip()
     if 'html_url' not in stripped or 'full_name' not in stripped:
         return raw
@@ -180,11 +173,6 @@ def _compact_github_repos(raw: str) -> str:
 
 
 def _extract_screenshot_path(obs: str) -> Optional[str]:
-    """
-    Si l'observation d'un browser_screenshot contient un chemin de fichier image,
-    le retourne. Sinon retourne None.
-    Format attendu: "[DONE] Screenshot sauvegardé : /chemin/absolu/screenshot.png"
-    """
     m = re.search(r'Screenshot sauvegardé\s*:\s*(.+\.png)', obs)
     if m:
         path = m.group(1).strip()
@@ -195,13 +183,15 @@ def _extract_screenshot_path(obs: str) -> Optional[str]:
 
 class AgentOrchestrator:
     def __init__(self, llm_provider: LLMProvider, dispatcher: ToolDispatcher,
-                 on_event: Optional[Callable[[str, str], None]] = None):
-        self.llm_provider = llm_provider
-        self.dispatcher   = dispatcher
-        self.on_event     = on_event or (lambda e, d: print(f"[{e}] {d}", end="", flush=True))
+                 on_event: Optional[Callable[[str, str], None]] = None,
+                 memory_store=None):   # type: MemoryStore | None
+        self.llm_provider  = llm_provider
+        self.dispatcher    = dispatcher
+        self.on_event      = on_event or (lambda e, d: print(f"[{e}] {d}", end="", flush=True))
         self.security_mode: str           = SecurityMode.MONITORING
         self.current_scope: Optional[str] = None
         self.chat_history: list           = []
+        self.memory_store                 = memory_store  # peut être None
 
     def _emit(self, event_type: str, data: str):
         try:
@@ -239,21 +229,27 @@ class AgentOrchestrator:
                 history_text += f"Agent: {content}\n"
             elif role == "tool":
                 history_text += f"Observation: {content}\n"
+
         scope_info = f" | Scope : {self.current_scope}" if self.current_scope else ""
+
+        # ── Injection mémoire persistante ──────────────────────────────────
+        memory_section = ""
+        if self.memory_store is not None:
+            summary = self.memory_store.summary_for_prompt()
+            if summary:
+                memory_section = f"\n{summary}\n"
+        # ──────────────────────────────────────────────────────────────────
+
         return SYSTEM_PROMPT_TEMPLATE.format(
             tools_description=self.dispatcher.get_tools_description(),
             security_mode=self.security_mode,
             scope_info=scope_info,
+            memory_section=memory_section,
             history=history_text or "(aucun historique)",
             task=task
         )
 
     def _parse_llm_response(self, raw: str) -> tuple[Optional[Dict], bool]:
-        """
-        Extrait le PREMIER objet JSON valide de la réponse.
-        Strippes les blocs <think> avant parsing.
-        Retourne (parsed, had_multiple).
-        """
         raw = _strip_think_blocks(raw)
         candidates = [m.start() for m in re.finditer(r'\{', raw)]
         had_multiple = False
@@ -296,6 +292,14 @@ class AgentOrchestrator:
 
     def run_agentic_cycle(self, initial_prompt: str, max_steps: int = 8) -> Optional[str]:
         task = initial_prompt
+
+        # Charger l'historique de session persisté comme point de départ
+        if self.memory_store is not None and not self.chat_history:
+            self.chat_history = list(self.memory_store.session_history)
+
+        # Ajouter la requête user à l'historique
+        self.chat_history.append({"role": "user", "content": initial_prompt})
+
         for step in range(max_steps):
             self._emit(EVT_STEP, f"Étape {step + 1}/{max_steps}")
             system_prompt = self._build_system_prompt(task)
@@ -325,6 +329,9 @@ class AgentOrchestrator:
             if action == "final_answer":
                 answer = parsed.get("answer", "")
                 self._emit(EVT_ANSWER, answer)
+                # ── Persister l'historique de session après chaque cycle ──
+                if self.memory_store is not None:
+                    self.memory_store.set_session_history(self.chat_history)
                 return answer
 
             elif action == "tool":
@@ -342,17 +349,13 @@ class AgentOrchestrator:
 
                 observation = self.dispatcher.dispatch_call(tool_name=tool_name, **params)
                 obs_str = str(observation)
-
-                # Compacter les réponses JSON verbeux (repos GitHub, etc.)
                 obs_compact = _compact_github_repos(obs_str)
 
-                # --- P2-002 : détecter un screenshot et émettre l'événement dédié
                 if tool_name == "browser_screenshot":
                     img_path = _extract_screenshot_path(obs_compact)
                     if img_path:
                         self._emit(EVT_SCREENSHOT, img_path)
 
-                # --- P2-001 : hints différenciés selon la catégorie de l'outil
                 if obs_compact.startswith("[ERREUR]"):
                     obs_for_llm = (
                         obs_compact +
@@ -360,14 +363,12 @@ class AgentOrchestrator:
                         "final_answer pour expliquer l'échec. Ne répète PAS la même commande."
                     )
                 elif tool_name in TERMINAL_TOOLS:
-                    # L'outil a livré une donnée : l'agent doit lire et répondre
                     obs_for_llm = (
                         obs_compact +
                         "\n→ Donnée reçue. Lis l'observation ci-dessus et appelle "
                         "final_answer avec cette information. N'utilise plus d'outils."
                     )
                 elif tool_name in INTERMEDIATE_TOOLS:
-                    # L'outil a exécuté une action intermédiaire
                     obs_for_llm = (
                         obs_compact +
                         "\n→ Action exécutée. Si d'autres étapes sont nécessaires, "
@@ -384,5 +385,8 @@ class AgentOrchestrator:
                 self.chat_history.append({"role": "tool",
                     "content": f"Action '{action}' inconnue. Utilise 'tool' ou 'final_answer'."})
 
+        # Timeout — persister quand même
+        if self.memory_store is not None:
+            self.memory_store.set_session_history(self.chat_history)
         self._emit(EVT_WARNING, "[TIMEOUT] Nombre maximum d'étapes atteint.")
         return "[TIMEOUT] L'agent n'a pas pu terminer dans le nombre d'étapes autorisé."

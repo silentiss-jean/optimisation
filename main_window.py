@@ -19,6 +19,7 @@ from providers.lmstudio_provider import LMStudioProvider
 from providers.openai_provider import OpenAIProvider
 from providers.perplexity_provider import PerplexityProvider
 from tools.tool_dispatcher import ToolDispatcher
+from tools.memory_store import MemoryStore
 from tools.agent_orchestrator import (
     AgentOrchestrator, SecurityMode,
     EVT_THINKING, EVT_ACTION, EVT_OBSERVE, EVT_ANSWER,
@@ -39,7 +40,6 @@ API_KEY_HINTS = {
     "Perplexity (Sonar)": "pplx-... → console.perplexity.ai",
 }
 
-# Endpoints pour lister les modèles locaux
 MODEL_LIST_ENDPOINTS = {
     "Ollama (local)": ("http://localhost:11434/api/tags",
                        lambda d: [m["name"] for m in d.get("models", [])]),
@@ -47,19 +47,16 @@ MODEL_LIST_ENDPOINTS = {
                            lambda d: [m["id"] for m in d.get("data", [])]),
 }
 
-# Commandes de démarrage affichées dans les messages d'erreur
 START_COMMANDS = {
     "Ollama (local)": "ollama serve",
     "LM Studio (local)": "Lancez LM Studio et activez \"Local Server\" dans l'interface.",
 }
 
-# Modèles connus pour être incompatibles avec l'architecture ReAct
 REACT_INCOMPATIBLE_PATTERNS = [
     "llama3.1", "llama3:8b", "llama3.1:8b", "llama3.1:70b",
     "llama2", "mistral:7b", "mistral:latest",
 ]
 
-# Largeur maximale des screenshots affichés inline dans le log (px)
 SCREENSHOT_MAX_WIDTH = 780
 
 # ────────────────────────────────────────────────────── streaming colors
@@ -71,7 +68,7 @@ EVENT_COLORS = {
     EVT_ANSWER:     "#fff176",
     EVT_WARNING:    "#ff8a65",
     EVT_SECURITY:   "#ef5350",
-    EVT_SCREENSHOT: "#b39ddb",  # violet doux pour l'en-tête screenshot
+    EVT_SCREENSHOT: "#b39ddb",
 }
 EVENT_PREFIX = {
     EVT_STEP:     "\n\u254d\u254d\u254d {data} \u254d\u254d\u254d",
@@ -172,7 +169,9 @@ class LLMWorker(QThread):
     def __init__(self, prompt: str, provider: LLMProvider,
                  dispatcher: ToolDispatcher,
                  security_mode: str, scope: str,
-                 provider_name: str = ""):
+                 provider_name: str = "",
+                 memory_store: MemoryStore | None = None,
+                 chat_history: list | None = None):
         super().__init__()
         self.prompt        = prompt
         self.provider      = provider
@@ -180,14 +179,18 @@ class LLMWorker(QThread):
         self.security_mode = security_mode
         self.scope         = scope or None
         self.provider_name = provider_name
+        self.memory_store  = memory_store
+        self.chat_history  = list(chat_history) if chat_history else []
 
     def run(self):
         try:
             orc = AgentOrchestrator(
                 llm_provider=self.provider,
                 dispatcher=self.dispatcher,
-                on_event=lambda evt, data: self.event_signal.emit(evt, data)
+                on_event=lambda evt, data: self.event_signal.emit(evt, data),
+                memory_store=self.memory_store,
             )
+            orc.chat_history = self.chat_history
             orc.set_safety_mode(self.security_mode, self.scope)
             answer = orc.run_agentic_cycle(self.prompt)
             self.finished_signal.emit(bool(answer), "")
@@ -218,6 +221,8 @@ class MainWindow(QMainWindow):
         self.dispatcher        = ToolDispatcher()
         self._thinking_started = False
         self._trust_expiry: datetime | None = None
+        # ── Mémoire persistante partagée entre toutes les requêtes ──
+        self.memory_store      = MemoryStore()
         self._setup_ui()
 
     # ────────────────────────────────── fetch models from local server
@@ -341,6 +346,17 @@ class MainWindow(QMainWindow):
         if folder:
             self.scope_input.setText(folder)
 
+    # ─────────────────────────────────────────────────────── clear memory
+    def _clear_memory(self):
+        reply = QMessageBox.question(
+            self, "Effacer la mémoire",
+            "Effacer toute la mémoire (historique de session + faits longue durée) ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.memory_store.clear_all()
+            self._append_colored("\n🗑️  Mémoire effacée.\n", "#888888")
+
     # ─────────────────────────────────────────────────────── setup UI
     def _setup_ui(self):
         central = QWidget()
@@ -377,11 +393,11 @@ class MainWindow(QMainWindow):
         self.refresh_btn.clicked.connect(self._fetch_local_models)
         local_layout.addWidget(self.model_combo)
         local_layout.addWidget(self.refresh_btn)
-        self.model_stack.addWidget(local_widget)    # index 0
+        self.model_stack.addWidget(local_widget)
 
         self.model_input = QLineEdit()
         self.model_input.setPlaceholderText("gpt-3.5-turbo")
-        self.model_stack.addWidget(self.model_input)  # index 1
+        self.model_stack.addWidget(self.model_input)
 
         self.model_stack.setCurrentIndex(0)
         cfg_layout.addRow("Modèle :", self.model_stack)
@@ -438,19 +454,42 @@ class MainWindow(QMainWindow):
         self.scope_input.setVisible(False)
         self.scope_browse.setVisible(False)
 
-        root.addWidget(QLabel("Conversation & Étapes ReAct :"))
+        # ── Titre log + bouton mémoire ──
+        log_header = QHBoxLayout()
+        log_header.addWidget(QLabel("Conversation & Étapes ReAct :"))
+        log_header.addStretch()
+        # Info fichier mémoire
+        mem_path_label = QLabel(f"💾 {self.memory_store.path}")
+        mem_path_label.setStyleSheet("color:#555555; font-size:11px;")
+        log_header.addWidget(mem_path_label)
+        self.clear_mem_btn = QPushButton("🗑️ Effacer mémoire")
+        self.clear_mem_btn.setFixedHeight(28)
+        self.clear_mem_btn.setToolTip("Efface l'historique de session et la mémoire longue durée")
+        self.clear_mem_btn.clicked.connect(self._clear_memory)
+        log_header.addWidget(self.clear_mem_btn)
+        root.addLayout(log_header)
+
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setStyleSheet(
             "background-color:#1e1e1e; color:#cccccc;"
             "font-family:'Consolas',monospace; font-size:13px;"
         )
+        # Afficher infos mémoire au démarrage
+        hist_count = len(self.memory_store.session_history)
+        lt_count   = len(self.memory_store.long_term)
         self._append_colored(
             "Bienvenue dans l'Optimisation AI Agent.\n"
             "Sélectionnez un provider et un mode sécurité, puis lancez votre requête.\n"
-            "Cliquez \U0001f504 pour charger les modèles disponibles du provider local.",
+            "Cliquez \U0001f504 pour charger les modèles disponibles du provider local.\n",
             "#888888"
         )
+        if hist_count or lt_count:
+            self._append_colored(
+                f"💾 Mémoire chargée : {hist_count} messages de session, "
+                f"{lt_count} fait(s) longue durée.\n",
+                "#4fc3f7"
+            )
         root.addWidget(self.log_output)
 
         bar = QHBoxLayout()
@@ -477,10 +516,6 @@ class MainWindow(QMainWindow):
         self.log_output.ensureCursorVisible()
 
     def _insert_screenshot(self, img_path: str):
-        """
-        Insère une image inline dans le log PyQt6.
-        L'image est redimensionnée si elle dépasse SCREENSHOT_MAX_WIDTH.
-        """
         pixmap = QPixmap(img_path)
         if pixmap.isNull():
             self._append_colored(f"\n[screenshot non lisible : {img_path}]\n", "#ff8a65")
@@ -492,11 +527,10 @@ class MainWindow(QMainWindow):
                 Qt.TransformationMode.SmoothTransformation
             )
 
-        # Enregistrer le pixmap dans le document pour pouvoir l'insérer par nom
         doc = self.log_output.document()
         img_name = f"screenshot_{id(img_path)}"
         doc.addResource(
-            doc.ResourceType.ImageResource,  # type: ignore[attr-defined]
+            doc.ResourceType.ImageResource,
             __import__('PyQt6.QtCore', fromlist=['QUrl']).QUrl(img_name),
             pixmap
         )
@@ -504,13 +538,11 @@ class MainWindow(QMainWindow):
         cursor = self.log_output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
-        # En-tête
         fmt_text = QTextCharFormat()
         fmt_text.setForeground(QColor(EVENT_COLORS[EVT_SCREENSHOT]))
         cursor.setCharFormat(fmt_text)
         cursor.insertText(f"\n\U0001f4f8 Screenshot ({pixmap.width()}x{pixmap.height()}px) :\n")
 
-        # Image inline
         img_fmt = QTextImageFormat()
         img_fmt.setName(img_name)
         img_fmt.setWidth(pixmap.width())
@@ -522,7 +554,6 @@ class MainWindow(QMainWindow):
         self.log_output.ensureCursorVisible()
 
     def _on_event(self, event_type: str, data: str):
-        # ─ screenshot : insertion inline spéciale
         if event_type == EVT_SCREENSHOT:
             self._insert_screenshot(data)
             return
@@ -578,9 +609,13 @@ class MainWindow(QMainWindow):
             f"\U0001f6e1\ufe0f  {badge_label}{' | scope: ' + scope if scope else ''}\n",
             "#aaaaaa"
         )
+        # Passer le MemoryStore + l'historique courant au worker
+        current_history = list(self.memory_store.session_history)
         self.worker = LLMWorker(
             prompt, provider, self.dispatcher, mode, scope,
-            provider_name=provider_name
+            provider_name=provider_name,
+            memory_store=self.memory_store,
+            chat_history=current_history,
         )
         self.worker.event_signal.connect(self._on_event)
         self.worker.finished_signal.connect(self._run_finished)
