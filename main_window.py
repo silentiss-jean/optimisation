@@ -183,6 +183,17 @@ class LLMWorker(QThread):
         self.provider_name = provider_name
         self.memory_store  = memory_store
         self.chat_history  = list(chat_history) if chat_history else []
+        self._stop_requested = False          # ← flag d'arrêt
+
+    def request_stop(self):
+        """Demande l'arrêt propre du cycle ReAct."""
+        self._stop_requested = True
+        # Si l'orchestrateur expose un flag, on le propage
+        if hasattr(self, '_orc') and self._orc is not None:
+            try:
+                self._orc.stop_requested = True
+            except Exception:
+                pass
 
     def run(self):
         try:
@@ -192,12 +203,19 @@ class LLMWorker(QThread):
                 on_event=lambda evt, data: self.event_signal.emit(evt, data),
                 memory_store=self.memory_store,
             )
+            self._orc = orc                    # ← réf pour request_stop()
             orc.chat_history = self.chat_history
             orc.set_safety_mode(self.security_mode, self.scope)
             answer = orc.run_agentic_cycle(self.prompt)
-            self.finished_signal.emit(bool(answer), "")
+            if self._stop_requested:
+                self.finished_signal.emit(False, "interrompu")
+            else:
+                self.finished_signal.emit(bool(answer), "")
         except Exception as e:
             err = str(e)
+            if self._stop_requested:
+                self.finished_signal.emit(False, "interrompu")
+                return
             if self.provider_name in LOCAL_PROVIDERS and (
                 "Connection refused" in err or "111" in err or "timed out" in err.lower()
                 or "ConnectionRefusedError" in err or "RemoteDisconnected" in err
@@ -212,6 +230,8 @@ class LLMWorker(QThread):
             else:
                 self.event_signal.emit(EVT_WARNING, f"EXCEPTION : {err}")
                 self.finished_signal.emit(False, err)
+        finally:
+            self._orc = None
 
 
 # ═══════════════════════════════════════════════════════════════════ MainWindow
@@ -224,6 +244,7 @@ class MainWindow(QMainWindow):
         self._thinking_started = False
         self._trust_expiry: datetime | None = None
         self.memory_store      = MemoryStore()
+        self.worker: LLMWorker | None = None
         self._setup_ui()
 
     # ────────────────────────────────── fetch models from local server
@@ -390,6 +411,26 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(current)
         self.progress_label.setText(text or f"Étape {current}/{total}")
 
+    # ─────────────────────────────────────────────────────── stop handler
+    def _stop_agent(self):
+        """Interrompt proprement le worker en cours."""
+        if self.worker and self.worker.isRunning():
+            self._append_colored("\n⏹️  Arrêt demandé…\n", "#ff8a65")
+            self.progress_label.setText("⏹️ Interruption…")
+            self.worker.request_stop()
+            # Laisse 3 s au thread pour se terminer proprement, sinon force
+            if not self.worker.wait(3000):
+                self.worker.terminate()
+                self.worker.wait()
+                self._append_colored("\n\u26a0\ufe0f  Thread forcément arrêté.\n", "#ff8a65")
+            self.stop_button.setVisible(False)
+            self.submit_button.setEnabled(True)
+            self.prompt_input.setEnabled(True)
+            self._thinking_started = False
+            maximum = self.progress_bar.maximum() or 1
+            self.progress_bar.setValue(maximum)
+            self.progress_label.setText("⏹️ Interrompu")
+
     # ─────────────────────────────────────────────────────── setup UI
     def _setup_ui(self):
         central = QWidget()
@@ -534,7 +575,7 @@ class MainWindow(QMainWindow):
         log_header.addWidget(QLabel("Conversation & Étapes ReAct :"))
         root.addLayout(log_header)
 
-        # ── Barre de progression (P3-003) ─────────────────────────────────────
+        # ── Barre de progression ─────────────────────────────────────
         progress_row = QHBoxLayout()
         progress_row.setSpacing(8)
         progress_title = QLabel("Progression :")
@@ -551,7 +592,6 @@ class MainWindow(QMainWindow):
                 border:1px solid #333333;
                 border-radius:4px;
                 color:#cccccc;
-                height:18px;
             }
             QProgressBar::chunk {
                 background-color:#4fc3f7;
@@ -564,7 +604,6 @@ class MainWindow(QMainWindow):
         progress_row.addWidget(self.progress_bar, 1)
         progress_row.addWidget(self.progress_label)
         root.addLayout(progress_row)
-        # ─────────────────────────────────────────────────────────────────────
 
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
@@ -588,6 +627,7 @@ class MainWindow(QMainWindow):
             )
         root.addWidget(self.log_output)
 
+        # ── Barre de saisie + bouton Exécuter + bouton Stop ──────────────────
         bar = QHBoxLayout()
         self.prompt_input  = QLineEdit()
         self.prompt_input.setPlaceholderText("Entrez votre requête ici...")
@@ -595,8 +635,22 @@ class MainWindow(QMainWindow):
         self.submit_button.setFixedHeight(36)
         self.submit_button.clicked.connect(self.start_agent_run)
         self.prompt_input.returnPressed.connect(self.start_agent_run)
+
+        self.stop_button = QPushButton("\u23f9\ufe0f  Stop")
+        self.stop_button.setFixedHeight(36)
+        self.stop_button.setFixedWidth(90)
+        self.stop_button.setToolTip("Interrompre la requête en cours")
+        self.stop_button.setStyleSheet(
+            "QPushButton { background:#5a1a1a; color:#ff6b6b; border-radius:4px; font-weight:bold; }"
+            "QPushButton:hover { background:#7a2020; }"
+            "QPushButton:disabled { background:#2a2a2a; color:#555555; }"
+        )
+        self.stop_button.setVisible(False)     # caché au démarrage
+        self.stop_button.clicked.connect(self._stop_agent)
+
         bar.addWidget(self.prompt_input)
         bar.addWidget(self.submit_button)
+        bar.addWidget(self.stop_button)
         root.addLayout(bar)
         self.setCentralWidget(central)
 
@@ -644,15 +698,12 @@ class MainWindow(QMainWindow):
         self.log_output.ensureCursorVisible()
 
     def _on_event(self, event_type: str, data: str):
-        # ── Progression : parse "Étape N/M" depuis EVT_STEP ──────────────────
         if event_type == EVT_STEP:
             m = re.search(r"[EÉ]tape\s+(\d+)/(\d+)", data)
             if m:
                 self._set_progress(int(m.group(1)), int(m.group(2)), data)
             else:
-                # Pas de N/M → avance juste le label
                 self.progress_label.setText(data[:60] if data else "…")
-            # On laisse aussi l'affichage texte se faire (pas de return ici)
 
         if event_type == EVT_SCREENSHOT:
             self._insert_screenshot(data)
@@ -702,8 +753,9 @@ class MainWindow(QMainWindow):
 
         self.submit_button.setEnabled(False)
         self.prompt_input.setEnabled(False)
+        self.stop_button.setVisible(True)      # ← affiche le bouton Stop
         self._thinking_started = False
-        self._set_progress(0, 8, "Démarrage…")          # ← P3-003
+        self._set_progress(0, 8, "Démarrage…")
         self._append_colored(
             f"\n\n\U0001f4ac Vous : {prompt}\n"
             f"\U0001f50c {provider_name} | {model_name}\n"
@@ -722,16 +774,21 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _run_finished(self, success: bool, error: str):
-        # ── Finalise la barre de progression ─────────────────────────────────
         maximum = self.progress_bar.maximum() or 1
         self.progress_bar.setValue(maximum)
-        self.progress_label.setText("✅ Terminé" if success else "❌ Échec")
-        # ─────────────────────────────────────────────────────────────────────
+        interrupted = (error == "interrompu")
+        if interrupted:
+            self.progress_label.setText("⏹️ Interrompu")
+        else:
+            self.progress_label.setText("✅ Terminé" if success else "❌ Échec")
         self.submit_button.setEnabled(True)
         self.prompt_input.setEnabled(True)
+        self.stop_button.setVisible(False)     # ← cache le bouton Stop
         self.prompt_input.clear()
         self._thinking_started = False
-        if success:
+        if interrupted:
+            self._append_colored("\n⏹️ Requête interrompue.\n", "#ff8a65")
+        elif success:
             self._append_colored("\n" + "\u2550" * 60 + "\n", "#444444")
         else:
             self._append_colored(f"\n\u274c Échec : {error}\n", "#ef5350")
